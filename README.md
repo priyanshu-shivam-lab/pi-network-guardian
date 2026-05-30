@@ -1,11 +1,8 @@
 # ⚡ Pi Network Guardian
 
-![Deploy](https://github.com/YOUR_USERNAME/pi-server-monitor/actions/workflows/deploy.yml/badge.svg)
-
 A lightweight Node.js server monitor designed to run on a **Raspberry Pi** (or any always-on machine). It pings your servers every 10 seconds, detects power outages by checking the gateway, automatically sends **Wake-on-LAN** packets to bring servers back up, and emails the admin once connectivity is restored.
 
-> 📦 **Deployment:** See [DEPLOY.md](./DEPLOY.md) for the full GitHub Actions + PM2 setup guide.
-
+> 📦 **Deployment:** Runs on PM2. See [DEPLOY.md](./DEPLOY.md) for the full setup guide.
 
 ---
 
@@ -135,9 +132,11 @@ pi-server-monitor/
 ├── server.js          # Backend: monitoring logic, REST API, WebSocket, email
 ├── public/
 │   └── index.html     # Frontend: real-time dashboard
+├── deploy.sh          # Run on Pi to pull & reload: bash deploy.sh
 ├── servers.json       # Auto-generated: persisted server list (git-ignored)
 ├── .env               # Your credentials (git-ignored)
 ├── .env.example       # Template — safe to commit
+├── DEPLOY.md          # Full deployment guide
 ├── package.json
 └── .gitignore
 ```

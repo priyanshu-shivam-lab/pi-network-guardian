@@ -1,144 +1,170 @@
-# Deployment Guide – GitHub Actions + PM2 on Raspberry Pi
+# Deployment Guide – PM2 on Raspberry Pi 4
 
-This guide walks you through setting up automatic deployment so every `git push` to `main` automatically updates the app running on your Pi.
+This guide sets up the app as a managed background service on your Pi using **PM2**.
+Deployments are manual: you `git push` from your dev machine, then SSH into the Pi and run `bash deploy.sh`.
 
 ## Architecture
 
 ```
-Your machine          GitHub              Raspberry Pi
-──────────────        ──────────          ────────────────────────────
-git push ──────────►  triggers workflow ──► self-hosted runner pulls code
-                                            npm ci
-                                            pm2 reload pi-guardian
+Your machine              Raspberry Pi 4 (1 GB RAM)
+──────────────            ──────────────────────────────
+git push origin main      SSH into Pi
+                          bash deploy.sh
+                            │
+                            ├── git pull origin main
+                            ├── npm ci --omit=dev
+                            └── pm2 reload pi-guardian
 ```
 
-> The Pi acts as both the **deployment target** AND the **GitHub Actions runner**.
-> GitHub never needs to reach into your private network — the Pi reaches out to GitHub.
+### Approximate idle RAM usage
+
+| Process | RAM |
+|---|---|
+| Node.js app (server.js) | ~50–80 MB |
+| PM2 daemon | ~30–50 MB |
+| **Total** | **~80–130 MB** |
+
+This leaves ~870 MB free for the OS and other tasks — comfortable on a 1 GB Pi 4.
 
 ---
 
-## Step 1 — Install Node.js and PM2 on the Pi
+## One-time setup on the Pi
 
-SSH into your Pi, then run:
+### Step 1 — Install Node.js via nvm
 
 ```bash
-# Install Node.js (LTS) via nvm – recommended
+# Install nvm
 curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
 source ~/.bashrc
+
+# Install Node.js LTS
 nvm install --lts
+nvm use --lts
 
 # Verify
-node -v && npm -v
-
-# Install PM2 globally
-npm install -g pm2
+node -v   # should print v20.x.x or higher
+npm -v
 ```
 
----
+### Step 2 — Install PM2 globally
 
-## Step 2 — Clone the repo on the Pi
+```bash
+npm install -g pm2
+pm2 --version   # verify install
+```
+
+### Step 3 — Clone the repository
 
 ```bash
 cd ~
 git clone https://github.com/YOUR_USERNAME/pi-server-monitor.git
 cd pi-server-monitor
-
-# Create your .env file (this is gitignored and stays only on the Pi)
-cp .env.example .env
-nano .env          # fill in GATEWAY_IP, SMTP credentials, ADMIN_EMAIL
 ```
 
----
-
-## Step 3 — First manual start with PM2
+### Step 4 — Create your .env file
 
 ```bash
-cd ~/pi-server-monitor
-npm ci --omit=dev
-pm2 start server.js --name pi-guardian
-pm2 save
-
-# Make PM2 start automatically on boot
-pm2 startup
-# Copy and run the command it prints (something like: sudo env PATH=... pm2 startup systemd ...)
+cp .env.example .env
+nano .env
 ```
 
-Verify it's running:
+Fill in all the values:
+
+```dotenv
+GATEWAY_IP=192.168.1.1        # your router IP
+PORT=3000
+SMTP_HOST=smtp.gmail.com
+SMTP_PORT=587
+SMTP_SECURE=false
+SMTP_USER=you@gmail.com
+SMTP_PASS=your-app-password   # Gmail App Password
+ADMIN_EMAIL=admin@yourdomain.com
+```
+
+> **Never commit `.env`** — it is already listed in `.gitignore`.
+
+### Step 5 — Install dependencies
+
+```bash
+npm ci --omit=dev
+```
+
+### Step 6 — Start the app with PM2
+
+```bash
+pm2 start server.js --name pi-guardian
+pm2 save
+```
+
+Check it's running:
 
 ```bash
 pm2 show pi-guardian
-# open http://<pi-ip>:3000 in your browser
+# Open http://<pi-ip-address>:3000 in your browser
 ```
 
----
+### Step 7 — Enable PM2 on boot
 
-## Step 4 — Install the GitHub Actions self-hosted runner on the Pi
-
-1. Go to your GitHub repo → **Settings** → **Actions** → **Runners** → **New self-hosted runner**
-2. Select **Linux** / **ARM64** (for Pi 4/5) or **ARM** (for Pi 3 and older)
-3. Run the commands GitHub shows you on the Pi — they look like:
+This ensures the app restarts automatically if the Pi reboots (e.g. after a power cut):
 
 ```bash
-mkdir actions-runner && cd actions-runner
-curl -o actions-runner-linux-arm64-2.x.x.tar.gz -L https://github.com/actions/runner/releases/download/...
-tar xzf ./actions-runner-linux-arm64-2.x.x.tar.gz
-./config.sh --url https://github.com/YOUR_USERNAME/pi-server-monitor --token YOUR_TOKEN
+pm2 startup
 ```
 
-4. Install as a **system service** so it survives reboots:
+PM2 will print a command like:
+
+```
+sudo env PATH=$PATH:/home/pi/.nvm/versions/node/v20.x.x/bin pm2 startup systemd -u pi --hp /home/pi
+```
+
+**Copy and run that exact command**, then:
 
 ```bash
-sudo ./svc.sh install
-sudo ./svc.sh start
-
-# Check it's running
-sudo ./svc.sh status
+pm2 save   # save current process list so it's restored on boot
 ```
 
-The runner will now appear as **Online** in your GitHub repo's Runners settings page.
-
 ---
 
-## Step 5 — Set the APP_DIR repository variable
+## Deploying updates
 
-The workflow uses `${{ vars.APP_DIR }}` to know where the app lives on the Pi.
-
-1. Go to your GitHub repo → **Settings** → **Variables** → **Actions** → **New repository variable**
-2. Name: `APP_DIR`
-3. Value: `/home/pi/pi-server-monitor` (or wherever you cloned it)
-
----
-
-## Step 6 — Push and watch it deploy
+Whenever you push new code to GitHub, SSH into the Pi and run:
 
 ```bash
-# On your dev machine
-git add .
-git commit -m "chore: initial deployment setup"
-git push origin main
+cd ~/pi-server-monitor
+bash deploy.sh
 ```
 
-Go to your GitHub repo → **Actions** tab → watch the workflow run in real time.
-
-A successful run looks like:
-
-```
-✅ Pull latest code        – 2s
-✅ Install dependencies    – 8s
-✅ Restart app with PM2    – 2s
-✅ Health check            – 4s
-```
+The script does three things:
+1. `git pull origin main` — fetches your latest code
+2. `npm ci --omit=dev` — updates dependencies if `package-lock.json` changed
+3. `pm2 reload pi-guardian` — **zero-downtime** reload (the old process keeps serving until the new one is ready)
 
 ---
 
-## What stays on the Pi (never in git)
+## Daily operations reference
 
-| File | Why it's not in git |
-|---|---|
-| `.env` | Contains SMTP password and network config |
-| `servers.json` | Contains your local server IPs and MACs |
+```bash
+# View live logs
+pm2 logs pi-guardian
 
-These files are listed in `.gitignore`. The workflow uses `git pull` (not `git checkout`) so they are **never touched** by deployments.
+# Check status
+pm2 show pi-guardian
+
+# Restart (hard restart, brief downtime)
+pm2 restart pi-guardian
+
+# Reload (zero-downtime, preferred)
+pm2 reload pi-guardian
+
+# Stop
+pm2 stop pi-guardian
+
+# View all running processes and RAM usage
+pm2 list
+
+# Monitor CPU + RAM in real time
+pm2 monit
+```
 
 ---
 
@@ -146,26 +172,10 @@ These files are listed in `.gitignore`. The workflow uses `git pull` (not `git c
 
 | Problem | Fix |
 |---|---|
-| Runner shows **Offline** in GitHub | SSH into Pi, run `sudo ./svc.sh status` in the `actions-runner` dir |
-| `pm2: command not found` in workflow | PM2 isn't on PATH for the runner user. Add `export PATH="$HOME/.nvm/versions/node/.../bin:$PATH"` to `~/.bashrc` and `~/.profile`, then restart the runner service |
-| Deployment runs but app doesn't update | Make sure `APP_DIR` variable points to the correct directory |
-| `git pull` fails with merge conflict | On Pi: `git reset --hard origin/main` then push again to retrigger |
-| Port 3000 not accessible from LAN | Make sure the Pi's firewall allows port 3000: `sudo ufw allow 3000` |
-
----
-
-## Quick reference
-
-```bash
-# Check app status on Pi
-pm2 show pi-guardian
-
-# View live logs
-pm2 logs pi-guardian
-
-# Restart manually
-pm2 restart pi-guardian
-
-# View runner logs
-sudo journalctl -u actions.runner.* -f
-```
+| App not accessible from browser | Check port: `pm2 show pi-guardian` confirms it's `online`. Check firewall: `sudo ufw allow 3000` |
+| App crashes on startup | Check logs: `pm2 logs pi-guardian --lines 50` |
+| App doesn't restart after reboot | Re-run `pm2 startup`, copy the printed command, run it, then `pm2 save` |
+| `git pull` fails (merge conflict) | `git reset --hard origin/main` — caution: discards any local changes |
+| `npm ci` fails | Delete `node_modules/` and retry: `rm -rf node_modules && npm ci --omit=dev` |
+| `.env` overwritten by pull | It won't be — `.env` is gitignored and `git pull` never touches gitignored files |
+| `servers.json` lost after pull | Same as above — gitignored, safe |
