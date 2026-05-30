@@ -8,10 +8,10 @@ Deployments are manual: you `git push` from your dev machine, then SSH into the 
 ```
 Your machine              Raspberry Pi 4 (1 GB RAM)
 ──────────────            ──────────────────────────────
-git push origin main      SSH into Pi
+git push origin master      SSH into Pi
                           bash deploy.sh
                             │
-                            ├── git pull origin main
+                            ├── git pull origin master
                             ├── npm ci --omit=dev
                             └── pm2 reload pi-guardian
 ```
@@ -135,7 +135,7 @@ bash deploy.sh
 ```
 
 The script does three things:
-1. `git pull origin main` — fetches your latest code
+1. `git pull origin master` — fetches your latest code
 2. `npm ci --omit=dev` — updates dependencies if `package-lock.json` changed
 3. `pm2 reload pi-guardian` — **zero-downtime** reload (the old process keeps serving until the new one is ready)
 

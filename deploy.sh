@@ -16,7 +16,7 @@ echo ""
 
 # 1. Pull latest code from git
 echo "📥 Pulling latest code..."
-git -C "$APP_DIR" pull origin main
+git -C "$APP_DIR" pull origin master
 
 # 2. Install / update dependencies (skip devDependencies)
 echo ""
