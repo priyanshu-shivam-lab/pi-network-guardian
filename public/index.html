@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pi Network Guardian</title>
+    <meta name="description" content="Real-time server health monitor with automatic Wake-on-LAN and power outage email alerts.">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="/socket.io/socket.io.js"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+        * { font-family: 'Inter', sans-serif; }
+        .font-mono { font-family: 'JetBrains Mono', monospace; }
+
+        @keyframes pulse-slow { 0%, 100% { opacity: 1; } 50% { opacity: .4; } }
+        .animate-pulse-slow { animation: pulse-slow 2s ease-in-out infinite; }
+
+        @keyframes slide-down { from { transform: translateY(-12px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
+        .slide-down { animation: slide-down .3s ease; }
+
+        @keyframes spin-slow { to { transform: rotate(360deg); } }
+        .animate-spin-slow { animation: spin-slow 3s linear infinite; }
+
+        .card-glow-online  { box-shadow: 0 0 0 1px #065f46, 0 4px 24px rgba(16,185,129,.10); }
+        .card-glow-offline { box-shadow: 0 0 0 1px #7f1d1d, 0 4px 24px rgba(239,68,68,.12); }
+        .card-glow-waking  { box-shadow: 0 0 0 1px #78350f, 0 4px 24px rgba(234,179,8,.12); }
+        .card-glow-waiting { box-shadow: 0 0 0 1px #4c1d95, 0 4px 24px rgba(167,139,250,.12); }
+
+        #outage-banner { display: none; }
+    </style>
+</head>
+
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+
+    <div class="max-w-5xl mx-auto px-4 py-8">
+
+        <!-- Header -->
+        <header class="flex justify-between items-center mb-8">
+            <div class="flex items-center gap-3">
+                <div class="w-9 h-9 rounded-lg bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center text-lg">⚡</div>
+                <div>
+                    <h1 class="text-xl font-bold text-white leading-none">Pi Network Guardian</h1>
+                    <p class="text-xs text-gray-500 mt-0.5">Server health monitor &amp; power recovery</p>
+                </div>
+            </div>
+            <div class="flex items-center gap-2">
+                <span id="live-dot" class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse-slow inline-block"></span>
+                <span class="text-xs text-gray-400">Ping every 10s · Gateway every 2s</span>
+                <button onclick="toggleEmailPanel()" 
+                    class="ml-3 text-xs bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-300 px-3 py-1.5 rounded-lg transition flex items-center gap-1.5">
+                    <span>⚙️</span> Email Alerts
+                </button>
+            </div>
+        </header>
+
+        <!-- Power Outage Banner -->
+        <div id="outage-banner" class="slide-down mb-6 bg-purple-950/80 border border-purple-700 rounded-xl p-4 flex items-center gap-4">
+            <div class="text-3xl animate-pulse-slow">🔌</div>
+            <div class="flex-1">
+                <p class="font-semibold text-purple-300">Power Outage Detected</p>
+                <p class="text-sm text-purple-400 mt-0.5">Gateway is unreachable. All servers suspended. Email alert will be sent automatically once connectivity is restored.</p>
+                <p id="outage-timer" class="text-xs font-mono text-purple-500 mt-1"></p>
+            </div>
+        </div>
+
+        <!-- Server Grid -->
+        <div id="server-grid" class="grid grid-cols-1 md:grid-cols-2 gap-5 mb-8"></div>
+
+        <!-- Add Server Form -->
+        <div class="bg-gray-900 rounded-xl p-6 border border-gray-800 mb-6">
+            <h2 class="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-4">Add Server to Monitor</h2>
+            <form id="add-server-form" class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <input type="text" id="srv-name" placeholder="Name (e.g. NAS)"
+                    class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500/30 transition" required>
+                <input type="text" id="srv-ip" placeholder="IP (e.g. 192.168.1.50)"
+                    class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500/30 transition font-mono" required>
+                <input type="text" id="srv-mac" placeholder="MAC (e.g. aa:bb:cc:dd:ee:ff)"
+                    class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500/30 transition font-mono" required>
+                <button type="submit"
+                    class="sm:col-span-3 bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white text-sm font-semibold py-2 px-4 rounded-lg transition">
+                    + Add Server
+                </button>
+            </form>
+        </div>
+
+        <!-- Email Settings Panel (hidden by default) -->
+        <div id="email-panel" class="hidden bg-gray-900 rounded-xl p-6 border border-gray-800">
+            <div class="flex items-center justify-between mb-5">
+                <div>
+                    <h2 class="text-sm font-semibold text-gray-400 uppercase tracking-wider">Email Alert Settings</h2>
+                    <p class="text-xs text-gray-600 mt-1">Alerts are queued during outages and sent once the gateway comes back online.</p>
+                </div>
+                <span id="email-saved-badge" class="hidden text-xs text-emerald-400 bg-emerald-900/40 border border-emerald-800 px-2 py-1 rounded-full">✓ Saved</span>
+            </div>
+            <form id="email-config-form" class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-4">
+                <div class="sm:col-span-2 grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <input type="text" id="smtp-host" placeholder="SMTP Host (e.g. smtp.gmail.com)"
+                        class="sm:col-span-2 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/30 transition font-mono" required>
+                    <input type="number" id="smtp-port" placeholder="Port (e.g. 587)"
+                        class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/30 transition font-mono" required>
+                </div>
+                <input type="email" id="smtp-user" placeholder="SMTP Username / From Email"
+                    class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/30 transition font-mono" required>
+                <input type="password" id="smtp-pass" placeholder="SMTP Password / App Password"
+                    class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/30 transition" required>
+                <input type="email" id="admin-email" placeholder="Admin Alert Recipient Email"
+                    class="sm:col-span-2 bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/30 transition" required>
+                <label class="sm:col-span-2 flex items-center gap-2 text-sm text-gray-400 cursor-pointer select-none">
+                    <input type="checkbox" id="smtp-secure" class="w-4 h-4 rounded accent-blue-500">
+                    Use SSL/TLS (port 465)
+                </label>
+                <div class="sm:col-span-2 flex gap-3">
+                    <button type="submit"
+                        class="flex-1 bg-blue-600 hover:bg-blue-500 text-white text-sm font-semibold py-2 px-4 rounded-lg transition">
+                        Save Settings
+                    </button>
+                    <button type="button" id="test-email-btn"
+                        class="bg-gray-700 hover:bg-gray-600 text-gray-200 text-sm font-semibold py-2 px-4 rounded-lg transition">
+                        Send Test Email
+                    </button>
+                </div>
+            </form>
+            <p id="email-status-msg" class="text-xs text-center text-gray-600 min-h-[16px]"></p>
+        </div>
+
+    </div><!-- /container -->
+
+    <script>
+        const socket = io();
+        const serverGrid = document.getElementById('server-grid');
+        const addForm    = document.getElementById('add-server-form');
+        let outageStart  = null;
+        let timerInterval = null;
+
+        // ── Status Badges ─────────────────────────────────────────────────────
+        function makeBadge(status) {
+            const map = {
+                online:   `<span class="px-2 py-1 text-xs rounded-md bg-emerald-900/60 text-emerald-300 font-semibold border border-emerald-700/60">● ONLINE</span>`,
+                offline:  `<span class="px-2 py-1 text-xs rounded-md bg-red-900/60 text-red-300 font-semibold border border-red-700/60">● OFFLINE</span>`,
+                verifying:`<span class="px-2 py-1 text-xs rounded-md bg-orange-900/60 text-orange-300 font-semibold border border-orange-700/60 animate-pulse">🔍 VERIFYING…</span>`,
+                waking:   `<span class="px-2 py-1 text-xs rounded-md bg-yellow-900/60 text-yellow-300 font-semibold border border-yellow-700/60 animate-pulse">⚡ SENDING WOL</span>`,
+                'waiting-for-power': `<span class="px-2 py-1 text-xs rounded-md bg-purple-900/60 text-purple-300 font-semibold border border-purple-700/60 animate-pulse-slow">🔌 POWER LOSS</span>`,
+                checking: `<span class="px-2 py-1 text-xs rounded-md bg-gray-700 text-gray-400 font-semibold border border-gray-600">CHECKING...</span>`,
+            };
+            return map[status] || map.checking;
+        }
+
+        const glowMap = {
+            online:   'card-glow-online',
+            offline:  'card-glow-offline',
+            verifying:'card-glow-offline',
+            waking:   'card-glow-waking',
+            'waiting-for-power': 'card-glow-waiting',
+        };
+
+        // ── Render Server Cards ───────────────────────────────────────────────
+        socket.on('status-update', (servers) => {
+            serverGrid.innerHTML = '';
+            servers.forEach(srv => {
+                const glow = glowMap[srv.status] || '';
+                const card = document.createElement('div');
+                card.className = `bg-gray-900 border border-gray-800 rounded-xl p-5 flex flex-col justify-between transition-all duration-500 ${glow}`;
+                card.innerHTML = `
+                    <div>
+                        <div class="flex justify-between items-start mb-3">
+                            <h3 class="text-base font-bold text-white">${srv.name}</h3>
+                            ${makeBadge(srv.status)}
+                        </div>
+                        <p class="text-xs text-gray-500 font-mono mb-1">IP:&nbsp; <span class="text-gray-300">${srv.ip}</span></p>
+                        <p class="text-xs text-gray-500 font-mono">MAC: <span class="text-gray-300">${srv.mac}</span></p>
+                    </div>
+                    <div class="mt-4 flex justify-end">
+                        <button onclick="removeServer(${srv.id})"
+                            class="text-xs text-red-500/70 hover:text-red-400 border border-red-900/50 hover:border-red-700 px-2.5 py-1 rounded-lg transition">
+                            Remove
+                        </button>
+                    </div>
+                `;
+                serverGrid.appendChild(card);
+            });
+
+            if (servers.length === 0) {
+                serverGrid.innerHTML = `<div class="col-span-2 text-center text-gray-600 py-12 text-sm">No servers configured. Add one below.</div>`;
+            }
+        });
+
+        // ── Gateway / Outage Banner ────────────────────────────────────────────
+        socket.on('gateway-status', ({ alive, outageStartTime: ost }) => {
+            const banner = document.getElementById('outage-banner');
+            if (!alive) {
+                outageStart = ost || Date.now();
+                banner.style.display = 'flex';
+                if (!timerInterval) {
+                    timerInterval = setInterval(updateOutageTimer, 1000);
+                }
+            } else {
+                outageStart = null;
+                banner.style.display = 'none';
+                clearInterval(timerInterval);
+                timerInterval = null;
+            }
+        });
+
+        function updateOutageTimer() {
+            if (!outageStart) return;
+            const secs = Math.round((Date.now() - outageStart) / 1000);
+            const m = Math.floor(secs / 60);
+            const s = secs % 60;
+            document.getElementById('outage-timer').textContent =
+                `Outage duration: ${m > 0 ? m + 'm ' : ''}${s}s`;
+        }
+
+        // ── Add Server ────────────────────────────────────────────────────────
+        addForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            await fetch('/api/servers', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    name: document.getElementById('srv-name').value,
+                    ip:   document.getElementById('srv-ip').value,
+                    mac:  document.getElementById('srv-mac').value,
+                }),
+            });
+            addForm.reset();
+        });
+
+        // ── Remove Server ─────────────────────────────────────────────────────
+        async function removeServer(id) {
+            if (confirm('Remove this server from monitoring?')) {
+                await fetch(`/api/servers/${id}`, { method: 'DELETE' });
+            }
+        }
+
+        // ── Email Settings Panel ──────────────────────────────────────────────
+        function toggleEmailPanel() {
+            const panel = document.getElementById('email-panel');
+            panel.classList.toggle('hidden');
+            if (!panel.classList.contains('hidden')) loadEmailConfig();
+        }
+
+        async function loadEmailConfig() {
+            try {
+                const cfg = await fetch('/api/config/email').then(r => r.json());
+                document.getElementById('smtp-host').value   = cfg.host    || '';
+                document.getElementById('smtp-port').value   = cfg.port    || 587;
+                document.getElementById('smtp-user').value   = cfg.user    || '';
+                document.getElementById('smtp-pass').value   = cfg.pass    || '';
+                document.getElementById('admin-email').value = cfg.adminTo || '';
+                document.getElementById('smtp-secure').checked = cfg.secure || false;
+            } catch {}
+        }
+
+        document.getElementById('email-config-form').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            setEmailStatus('Saving…', 'text-gray-400');
+            const res = await fetch('/api/config/email', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    host:    document.getElementById('smtp-host').value,
+                    port:    document.getElementById('smtp-port').value,
+                    user:    document.getElementById('smtp-user').value,
+                    pass:    document.getElementById('smtp-pass').value,
+                    adminTo: document.getElementById('admin-email').value,
+                    secure:  document.getElementById('smtp-secure').checked,
+                }),
+            });
+            if (res.ok) {
+                setEmailStatus('✓ Settings saved.', 'text-emerald-400');
+                const badge = document.getElementById('email-saved-badge');
+                badge.classList.remove('hidden');
+                setTimeout(() => badge.classList.add('hidden'), 3000);
+            } else {
+                setEmailStatus('✗ Save failed.', 'text-red-400');
+            }
+        });
+
+        document.getElementById('test-email-btn').addEventListener('click', async () => {
+            const btn = document.getElementById('test-email-btn');
+            btn.disabled = true;
+            btn.textContent = 'Sending…';
+            setEmailStatus('', '');
+            try {
+                const res  = await fetch('/api/config/email/test', { method: 'POST' });
+                const data = await res.json();
+                if (res.ok) setEmailStatus('✓ ' + data.message, 'text-emerald-400');
+                else        setEmailStatus('✗ ' + data.error,   'text-red-400');
+            } catch (err) {
+                setEmailStatus('✗ Network error: ' + err.message, 'text-red-400');
+            }
+            btn.disabled = false;
+            btn.textContent = 'Send Test Email';
+        });
+
+        function setEmailStatus(msg, cls) {
+            const el = document.getElementById('email-status-msg');
+            el.textContent = msg;
+            el.className = `text-xs text-center min-h-[16px] ${cls}`;
+        }
+    </script>
+</body>
+
+</html>

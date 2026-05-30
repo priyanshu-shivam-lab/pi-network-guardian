@@ -1,0 +1,22 @@
+{
+  "name": "pi-server-monitor",
+  "version": "1.0.0",
+  "description": "",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "nodemailer": "^8.0.9",
+    "ping": "^1.0.0",
+    "socket.io": "^4.8.3",
+    "wake_on_lan": "^1.0.0"
+  }
+}
