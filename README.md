@@ -44,8 +44,8 @@ A lightweight Node.js server monitor designed to run on a **Raspberry Pi** (or a
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/your-username/pi-server-monitor.git
-cd pi-server-monitor
+git clone https://github.com/your-username/pi-network-guardian.git
+cd pi-network-guardian
 npm install
 ```
 
@@ -128,7 +128,7 @@ Every 10s: ping each server
 ## File structure
 
 ```
-pi-server-monitor/
+pi-network-guardian/
 ├── server.js          # Backend: monitoring logic, REST API, WebSocket, email
 ├── public/
 │   └── index.html     # Frontend: real-time dashboard

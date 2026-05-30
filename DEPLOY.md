@@ -57,8 +57,8 @@ pm2 --version   # verify install
 
 ```bash
 cd ~
-git clone https://github.com/YOUR_USERNAME/pi-server-monitor.git
-cd pi-server-monitor
+git clone https://github.com/YOUR_USERNAME/pi-network-guardian.git
+cd pi-network-guardian
 ```
 
 ### Step 4 — Create your .env file
@@ -130,7 +130,7 @@ pm2 save   # save current process list so it's restored on boot
 Whenever you push new code to GitHub, SSH into the Pi and run:
 
 ```bash
-cd ~/pi-server-monitor
+cd ~/pi-network-guardian
 bash deploy.sh
 ```
 
