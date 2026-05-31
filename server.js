@@ -26,19 +26,27 @@ function loadServers() {
         if (fs.existsSync(SERVERS_FILE)) {
             const raw = fs.readFileSync(SERVERS_FILE, 'utf8');
             const parsed = JSON.parse(raw);
-            // Reset runtime-only fields so we start clean
-            return parsed.map(s => ({ ...s, status: 'checking', lastWolSentAt: null, lastOnlineAt: null, confirming: false }));
+            // Reset runtime-only fields; preserve wolEnabled from disk
+            return parsed.map(s => ({
+                ...s,
+                wolEnabled:  s.wolEnabled !== false, // default true for legacy entries
+                status:      'checking',
+                lastWolSentAt: null,
+                lastOnlineAt:  null,
+                alertedAt:     null,  // timestamp of last server-down email (non-WoL servers)
+                confirming:    false,
+            }));
         }
     } catch (err) {
         console.warn('[STORE] Could not load servers.json, starting fresh:', err.message);
     }
-    return []; // No sample data – start empty
+    return [];
 }
 
 function saveServers() {
     try {
-        // Only persist fields that should survive a restart
-        const toSave = servers.map(({ id, name, ip, mac }) => ({ id, name, ip, mac }));
+        // Persist only stable, config-level fields
+        const toSave = servers.map(({ id, name, ip, mac, wolEnabled }) => ({ id, name, ip, mac, wolEnabled }));
         fs.writeFileSync(SERVERS_FILE, JSON.stringify(toSave, null, 2), 'utf8');
     } catch (err) {
         console.error('[STORE] Failed to save servers.json:', err.message);
@@ -136,9 +144,17 @@ async function sendOutageRecoveryEmail(affectedServers, outageDuration) {
 app.get('/api/servers', (req, res) => res.json(servers));
 
 app.post('/api/servers', (req, res) => {
-    const { name, ip, mac } = req.body;
-    if (!name || !ip || !mac) return res.status(400).json({ error: "Missing fields" });
-    const newServer = { id: Date.now(), name, ip, mac, status: "checking", lastWolSentAt: null, lastOnlineAt: null, confirming: false };
+    const { name, ip, mac, wolEnabled } = req.body;
+    const wol = wolEnabled !== false; // default true
+    if (!name || !ip) return res.status(400).json({ error: 'Name and IP are required.' });
+    if (wol && !mac)  return res.status(400).json({ error: 'MAC address is required when Wake-on-LAN is enabled.' });
+    const newServer = {
+        id: Date.now(), name, ip,
+        mac: mac || '',
+        wolEnabled: wol,
+        status: 'checking',
+        lastWolSentAt: null, lastOnlineAt: null, alertedAt: null, confirming: false,
+    };
     servers.push(newServer);
     saveServers();
     res.json(newServer);
@@ -194,15 +210,50 @@ async function checkGateway() {
     return res.alive;
 }
 
+// Send an immediate alert email when a non-WoL server is confirmed down.
+async function sendServerDownEmail(s) {
+    const transporter = buildTransporter();
+    if (!transporter) {
+        console.warn(`[EMAIL] SMTP not configured. Skipping down-alert for ${s.name}.`);
+        return;
+    }
+    const html = `
+        <div style="font-family:sans-serif;max-width:600px;margin:auto;background:#111827;color:#f9fafb;padding:24px;border-radius:12px;">
+            <h2 style="color:#f87171;margin-top:0;">🔴 Pi Network Guardian – Server Down Alert</h2>
+            <p>The following server is <strong>offline</strong> and requires <strong>manual intervention</strong>:</p>
+            <table style="width:100%;background:#1f2937;border-radius:8px;padding:16px;font-family:monospace;font-size:14px;border-collapse:collapse;">
+                <tr><td style="color:#9ca3af;padding:4px 8px;">Name</td><td style="color:#f9fafb;padding:4px 8px;">${s.name}</td></tr>
+                <tr><td style="color:#9ca3af;padding:4px 8px;">IP Address</td><td style="color:#f9fafb;padding:4px 8px;">${s.ip}</td></tr>
+                <tr><td style="color:#9ca3af;padding:4px 8px;">Wake-on-LAN</td><td style="color:#f87171;padding:4px 8px;">Disabled – no automatic recovery</td></tr>
+                <tr><td style="color:#9ca3af;padding:4px 8px;">Detected at</td><td style="color:#f9fafb;padding:4px 8px;">${new Date().toLocaleString()}</td></tr>
+            </table>
+            <p style="margin-top:16px;">Please check the device manually. The monitor will notify you again when it comes back online.</p>
+            <hr style="border-color:#374151;margin:24px 0;">
+            <p style="font-size:12px;color:#6b7280;">Sent by Pi Network Guardian</p>
+        </div>
+    `;
+    try {
+        await transporter.sendMail({
+            from: `"Pi Network Guardian" <${emailConfig.user}>`,
+            to: emailConfig.adminTo,
+            subject: `🔴 [DOWN] ${s.name} is offline – manual action required`,
+            text: `Server Down Alert\n\nName: ${s.name}\nIP: ${s.ip}\nWake-on-LAN: Disabled\nDetected: ${new Date().toLocaleString()}\n\nPlease check the device manually.`,
+            html,
+        });
+        console.log(`[EMAIL] Server-down alert sent for ${s.name} (WoL disabled).`);
+    } catch (err) {
+        console.error(`[EMAIL] Failed to send server-down alert for ${s.name}:`, err.message);
+    }
+}
+
 // Triggered when a server is confirmed DOWN after all confirmation pings fail.
-// Handles gateway check, WoL dispatch, and power-outage state.
 async function handleConfirmedDown(s) {
     console.log(`[CONFIRMED DOWN] ${s.name} failed all ${CONFIRM_PINGS} confirmation pings. Checking gateway...`);
 
     const gatewayAlive = await checkGateway();
 
     if (!gatewayAlive) {
-        // Power outage
+        // Power outage – handled by the existing outage email pipeline
         if (!gatewayWasDown) {
             gatewayWasDown = true;
             outageStartTime = Date.now();
@@ -211,13 +262,12 @@ async function handleConfirmedDown(s) {
             io.emit('gateway-status', { alive: false, outageStartTime });
         }
         s.status = 'waiting-for-power';
-    } else {
-        // Gateway is up – server genuinely down, send WoL
+    } else if (s.wolEnabled) {
+        // ── WoL ENABLED: send magic packet ──────────────────────────────────
         const now = Date.now();
         const cooldownExpired = !s.lastWolSentAt || (now - s.lastWolSentAt) >= WOL_COOLDOWN_MS;
-
         if (cooldownExpired) {
-            console.log(`[ALERT] ${s.name} confirmed down. Gateway is up. Triggering Wake-on-LAN...`);
+            console.log(`[WOL] ${s.name} confirmed down. Gateway up. Sending Wake-on-LAN...`);
             s.status = 'waking';
             s.lastWolSentAt = now;
             wol.wake(s.mac, (error) => {
@@ -227,6 +277,17 @@ async function handleConfirmedDown(s) {
             const retryIn = Math.round((WOL_COOLDOWN_MS - (now - s.lastWolSentAt)) / 1000);
             console.log(`[WAIT] ${s.name} still offline. WoL cooldown active – retry in ${retryIn}s.`);
             s.status = 'waking';
+        }
+    } else {
+        // ── WoL DISABLED: alert admin by email ──────────────────────────────
+        s.status = 'alerted';
+        if (!s.alertedAt) {
+            // Only send once per outage period (reset when server comes back online)
+            s.alertedAt = Date.now();
+            console.log(`[ALERT] ${s.name} is down and WoL is disabled. Sending email alert...`);
+            sendServerDownEmail(s);
+        } else {
+            console.log(`[SKIP ALERT] ${s.name} already alerted at ${new Date(s.alertedAt).toLocaleTimeString()}. Waiting for recovery.`);
         }
     }
 
@@ -315,8 +376,22 @@ async function monitorServers() {
         if (isAlive.alive) {
             if (s.status !== 'online') {
                 console.log(`[RECOVERED] ${s.name} is back online.`);
+                // If we had alerted (non-WoL server was down), send a recovery notification
+                if (!s.wolEnabled && s.alertedAt) {
+                    const transporter = buildTransporter();
+                    if (transporter) {
+                        transporter.sendMail({
+                            from: `"Pi Network Guardian" <${emailConfig.user}>`,
+                            to: emailConfig.adminTo,
+                            subject: `✅ [RECOVERED] ${s.name} is back online`,
+                            text: `Good news! ${s.name} (${s.ip}) is back online as of ${new Date().toLocaleString()}.`,
+                        }).catch(err => console.error(`[EMAIL] Recovery notice failed for ${s.name}:`, err.message));
+                        console.log(`[EMAIL] Recovery notice sent for ${s.name}.`);
+                    }
+                }
             }
             s.status = 'online';
+            s.alertedAt = null; // reset so next outage triggers a fresh email
             // Only reset the WoL cooldown once the server has been stably online
             // for STABLE_ONLINE_MS – prevents rapid WoL blasts on flapping devices.
             if (!s.lastOnlineAt) s.lastOnlineAt = Date.now();
@@ -359,8 +434,9 @@ setInterval(monitorServers, 10_000);
 io.on('connection', (socket) => {
     socket.emit('status-update', servers);
     socket.emit('gateway-status', {
-        alive: !gatewayWasDown,
+        alive:           !gatewayWasDown,
         outageStartTime: gatewayWasDown ? outageStartTime : null,
+        gatewayIp:       GATEWAY_IP,
     });
 });
 

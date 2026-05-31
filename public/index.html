@@ -22,10 +22,24 @@
         @keyframes spin-slow { to { transform: rotate(360deg); } }
         .animate-spin-slow { animation: spin-slow 3s linear infinite; }
 
-        .card-glow-online  { box-shadow: 0 0 0 1px #065f46, 0 4px 24px rgba(16,185,129,.10); }
-        .card-glow-offline { box-shadow: 0 0 0 1px #7f1d1d, 0 4px 24px rgba(239,68,68,.12); }
-        .card-glow-waking  { box-shadow: 0 0 0 1px #78350f, 0 4px 24px rgba(234,179,8,.12); }
-        .card-glow-waiting { box-shadow: 0 0 0 1px #4c1d95, 0 4px 24px rgba(167,139,250,.12); }
+        .card-glow-online   { box-shadow: 0 0 0 1px #065f46, 0 4px 24px rgba(16,185,129,.10); }
+        .card-glow-offline  { box-shadow: 0 0 0 1px #7f1d1d, 0 4px 24px rgba(239,68,68,.12); }
+        .card-glow-waking   { box-shadow: 0 0 0 1px #78350f, 0 4px 24px rgba(234,179,8,.12); }
+        .card-glow-waiting  { box-shadow: 0 0 0 1px #4c1d95, 0 4px 24px rgba(167,139,250,.12); }
+        .card-glow-alerted  { box-shadow: 0 0 0 1px #7f1d1d, 0 4px 24px rgba(239,68,68,.15); }
+
+        /* WoL toggle switch */
+        .wol-toggle { position:relative; display:inline-block; width:36px; height:20px; }
+        .wol-toggle input { opacity:0; width:0; height:0; }
+        .wol-slider { position:absolute; inset:0; background:#374151; border-radius:20px; cursor:pointer; transition:.2s; }
+        .wol-slider:before { content:""; position:absolute; width:14px; height:14px; left:3px; bottom:3px; background:#9ca3af; border-radius:50%; transition:.2s; }
+        input:checked + .wol-slider { background:#059669; }
+        input:checked + .wol-slider:before { transform:translateX(16px); background:#fff; }
+
+        /* Gateway status card transitions */
+        #gateway-card { transition: border-color .4s, box-shadow .4s, background .4s; }
+        #gateway-card.gw-online  { border-color:#065f46; box-shadow:0 0 0 0px #065f46, 0 4px 20px rgba(16,185,129,.10); }
+        #gateway-card.gw-offline { border-color:#6d28d9; box-shadow:0 0 0 0px #6d28d9, 0 4px 20px rgba(167,139,250,.15); }
 
         #outage-banner { display: none; }
     </style>
@@ -54,14 +68,41 @@
             </div>
         </header>
 
-        <!-- Power Outage Banner -->
-        <div id="outage-banner" class="slide-down mb-6 bg-purple-950/80 border border-purple-700 rounded-xl p-4 flex items-center gap-4">
-            <div class="text-3xl animate-pulse-slow">🔌</div>
-            <div class="flex-1">
-                <p class="font-semibold text-purple-300">Power Outage Detected</p>
-                <p class="text-sm text-purple-400 mt-0.5">Gateway is unreachable. All servers suspended. Email alert will be sent automatically once connectivity is restored.</p>
+        <!-- Gateway Status Card (always visible) -->
+        <div id="gateway-card" class="gw-online mb-6 bg-gray-900 border border-gray-800 rounded-xl px-5 py-4 flex items-center justify-between gap-4">
+
+            <!-- Left: icon + label -->
+            <div class="flex items-center gap-3 min-w-0">
+                <div id="gw-icon" class="w-10 h-10 rounded-lg flex items-center justify-center text-xl flex-shrink-0
+                     bg-emerald-500/10 border border-emerald-500/30">🌐</div>
+                <div class="min-w-0">
+                    <p class="text-sm font-semibold text-white leading-none">Default Gateway</p>
+                    <p id="gw-ip" class="text-xs font-mono text-gray-500 mt-0.5">—</p>
+                </div>
+            </div>
+
+            <!-- Centre: outage message (hidden when online) -->
+            <div id="gw-outage-msg" class="hidden flex-1 text-center">
+                <p class="text-sm font-semibold text-purple-300">Power Outage Detected</p>
+                <p class="text-xs text-purple-400 mt-0.5">Gateway unreachable · Email alert queued for when it recovers</p>
                 <p id="outage-timer" class="text-xs font-mono text-purple-500 mt-1"></p>
             </div>
+
+            <!-- Right: status badge + last-checked -->
+            <div class="flex flex-col items-end gap-1.5 flex-shrink-0">
+                <span id="gw-badge"
+                    class="px-2.5 py-1 text-xs font-semibold rounded-md
+                           bg-emerald-900/60 text-emerald-300 border border-emerald-700/60">
+                    ● ONLINE
+                </span>
+                <span id="gw-checked" class="text-xs text-gray-600 font-mono">checking…</span>
+            </div>
+
+        </div>
+
+        <!-- Legacy outage banner kept for JS compatibility -->
+        <div id="outage-banner" style="display:none">
+            <p id="outage-timer-legacy"></p>
         </div>
 
         <!-- Server Grid -->
@@ -75,8 +116,25 @@
                     class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500/30 transition" required>
                 <input type="text" id="srv-ip" placeholder="IP (e.g. 192.168.1.50)"
                     class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500/30 transition font-mono" required>
-                <input type="text" id="srv-mac" placeholder="MAC (e.g. aa:bb:cc:dd:ee:ff)"
-                    class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500/30 transition font-mono" required>
+
+                <!-- WoL toggle row -->
+                <div class="sm:col-span-3 flex items-center justify-between bg-gray-800/60 border border-gray-700 rounded-lg px-4 py-3">
+                    <div>
+                        <p class="text-sm font-medium text-gray-200">Wake-on-LAN</p>
+                        <p class="text-xs text-gray-500 mt-0.5">Enable if this device supports WoL (requires MAC address)</p>
+                    </div>
+                    <label class="wol-toggle ml-4 flex-shrink-0">
+                        <input type="checkbox" id="srv-wol" checked onchange="toggleMacField()">
+                        <span class="wol-slider"></span>
+                    </label>
+                </div>
+
+                <!-- MAC field — shown only when WoL is enabled -->
+                <div id="mac-field-wrap" class="sm:col-span-3">
+                    <input type="text" id="srv-mac" placeholder="MAC address (e.g. aa:bb:cc:dd:ee:ff)"
+                        class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500/30 transition font-mono">
+                </div>
+
                 <button type="submit"
                     class="sm:col-span-3 bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white text-sm font-semibold py-2 px-4 rounded-lg transition">
                     + Add Server
@@ -130,16 +188,16 @@
         const socket = io();
         const serverGrid = document.getElementById('server-grid');
         const addForm    = document.getElementById('add-server-form');
-        let outageStart  = null;
-        let timerInterval = null;
 
         // ── Status Badges ─────────────────────────────────────────────────────
+
         function makeBadge(status) {
             const map = {
                 online:   `<span class="px-2 py-1 text-xs rounded-md bg-emerald-900/60 text-emerald-300 font-semibold border border-emerald-700/60">● ONLINE</span>`,
                 offline:  `<span class="px-2 py-1 text-xs rounded-md bg-red-900/60 text-red-300 font-semibold border border-red-700/60">● OFFLINE</span>`,
                 verifying:`<span class="px-2 py-1 text-xs rounded-md bg-orange-900/60 text-orange-300 font-semibold border border-orange-700/60 animate-pulse">🔍 VERIFYING…</span>`,
                 waking:   `<span class="px-2 py-1 text-xs rounded-md bg-yellow-900/60 text-yellow-300 font-semibold border border-yellow-700/60 animate-pulse">⚡ SENDING WOL</span>`,
+                alerted:  `<span class="px-2 py-1 text-xs rounded-md bg-red-900/60 text-red-300 font-semibold border border-red-700/60 animate-pulse-slow">🔴 DOWN – ADMIN NOTIFIED</span>`,
                 'waiting-for-power': `<span class="px-2 py-1 text-xs rounded-md bg-purple-900/60 text-purple-300 font-semibold border border-purple-700/60 animate-pulse-slow">🔌 POWER LOSS</span>`,
                 checking: `<span class="px-2 py-1 text-xs rounded-md bg-gray-700 text-gray-400 font-semibold border border-gray-600">CHECKING...</span>`,
             };
@@ -147,10 +205,11 @@
         }
 
         const glowMap = {
-            online:   'card-glow-online',
-            offline:  'card-glow-offline',
-            verifying:'card-glow-offline',
-            waking:   'card-glow-waking',
+            online:    'card-glow-online',
+            offline:   'card-glow-offline',
+            verifying: 'card-glow-offline',
+            waking:    'card-glow-waking',
+            alerted:   'card-glow-alerted',
             'waiting-for-power': 'card-glow-waiting',
         };
 
@@ -159,6 +218,12 @@
             serverGrid.innerHTML = '';
             servers.forEach(srv => {
                 const glow = glowMap[srv.status] || '';
+                const wolPill = srv.wolEnabled
+                    ? `<span class="text-xs text-emerald-600/80 font-mono">⚡ WoL on</span>`
+                    : `<span class="text-xs text-gray-600 font-mono">🚫 WoL off</span>`;
+                const macRow = srv.wolEnabled && srv.mac
+                    ? `<p class="text-xs text-gray-500 font-mono">MAC: <span class="text-gray-300">${srv.mac}</span></p>`
+                    : '';
                 const card = document.createElement('div');
                 card.className = `bg-gray-900 border border-gray-800 rounded-xl p-5 flex flex-col justify-between transition-all duration-500 ${glow}`;
                 card.innerHTML = `
@@ -168,9 +233,10 @@
                             ${makeBadge(srv.status)}
                         </div>
                         <p class="text-xs text-gray-500 font-mono mb-1">IP:&nbsp; <span class="text-gray-300">${srv.ip}</span></p>
-                        <p class="text-xs text-gray-500 font-mono">MAC: <span class="text-gray-300">${srv.mac}</span></p>
+                        ${macRow}
                     </div>
-                    <div class="mt-4 flex justify-end">
+                    <div class="mt-4 flex justify-between items-center">
+                        ${wolPill}
                         <button onclick="removeServer(${srv.id})"
                             class="text-xs text-red-500/70 hover:text-red-400 border border-red-900/50 hover:border-red-700 px-2.5 py-1 rounded-lg transition">
                             Remove
@@ -185,45 +251,107 @@
             }
         });
 
-        // ── Gateway / Outage Banner ────────────────────────────────────────────
-        socket.on('gateway-status', ({ alive, outageStartTime: ost }) => {
-            const banner = document.getElementById('outage-banner');
-            if (!alive) {
+        // ── Gateway Status Card ───────────────────────────────────────────────
+        let outageStart   = null;
+        let timerInterval = null;
+
+        socket.on('gateway-status', ({ alive, outageStartTime: ost, gatewayIp }) => {
+            const card       = document.getElementById('gateway-card');
+            const icon       = document.getElementById('gw-icon');
+            const badge      = document.getElementById('gw-badge');
+            const ipEl       = document.getElementById('gw-ip');
+            const outageMsg  = document.getElementById('gw-outage-msg');
+            const checkedEl  = document.getElementById('gw-checked');
+
+            // Always show IP once we know it
+            if (gatewayIp) ipEl.textContent = gatewayIp;
+
+            const now = new Date();
+            checkedEl.textContent = 'Checked ' + now.toLocaleTimeString();
+
+            if (alive) {
+                // ── ONLINE state ──────────────────────────────────────────────
+                card.className = card.className.replace('gw-offline','') + ' gw-online';
+                card.style.background = '';
+
+                icon.className = icon.className.replace(/bg-\S+\/10|border-\S+\/30/g, '')
+                    + ' bg-emerald-500/10 border-emerald-500/30';
+                icon.textContent = '🌐';
+
+                badge.className = badge.className
+                    .replace(/bg-\S+\/60|text-\S+|border-\S+\/60/g, '')
+                    + ' bg-emerald-900/60 text-emerald-300 border-emerald-700/60';
+                badge.innerHTML = '● ONLINE';
+
+                outageMsg.classList.add('hidden');
+
+                // Clear outage timer
+                outageStart = null;
+                clearInterval(timerInterval); timerInterval = null;
+
+            } else {
+                // ── OFFLINE / OUTAGE state ────────────────────────────────────
+                card.classList.remove('gw-online');
+                card.classList.add('gw-offline');
+                card.style.background = 'rgba(46,16,101,.35)';
+
+                icon.textContent = '🔌';
+                icon.className = icon.className.replace(/bg-\S+\/10|border-\S+\/30/g, '')
+                    + ' bg-purple-500/10 border-purple-500/30';
+
+                badge.className = badge.className
+                    .replace(/bg-\S+\/60|text-\S+|border-\S+\/60/g, '')
+                    + ' bg-purple-900/60 text-purple-300 border-purple-700/60 animate-pulse-slow';
+                badge.innerHTML = '🔌 POWER LOSS';
+
+                outageMsg.classList.remove('hidden');
+
+                // Start outage timer
                 outageStart = ost || Date.now();
-                banner.style.display = 'flex';
                 if (!timerInterval) {
                     timerInterval = setInterval(updateOutageTimer, 1000);
+                    updateOutageTimer();
                 }
-            } else {
-                outageStart = null;
-                banner.style.display = 'none';
-                clearInterval(timerInterval);
-                timerInterval = null;
             }
         });
 
         function updateOutageTimer() {
             if (!outageStart) return;
             const secs = Math.round((Date.now() - outageStart) / 1000);
-            const m = Math.floor(secs / 60);
-            const s = secs % 60;
-            document.getElementById('outage-timer').textContent =
-                `Outage duration: ${m > 0 ? m + 'm ' : ''}${s}s`;
+            const m = Math.floor(secs / 60), s = secs % 60;
+            const txt = `Outage duration: ${m > 0 ? m + 'm ' : ''}${s}s`;
+            document.getElementById('outage-timer').textContent = txt;
+        }
+
+        // ── WoL toggle: show/hide MAC field ──────────────────────────────────
+        function toggleMacField() {
+            const wolOn = document.getElementById('srv-wol').checked;
+            const wrap  = document.getElementById('mac-field-wrap');
+            wrap.style.display = wolOn ? '' : 'none';
         }
 
         // ── Add Server ────────────────────────────────────────────────────────
         addForm.addEventListener('submit', async (e) => {
             e.preventDefault();
-            await fetch('/api/servers', {
+            const wolEnabled = document.getElementById('srv-wol').checked;
+            const body = {
+                name:       document.getElementById('srv-name').value,
+                ip:         document.getElementById('srv-ip').value,
+                wolEnabled,
+                mac: wolEnabled ? document.getElementById('srv-mac').value : '',
+            };
+            const res = await fetch('/api/servers', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    name: document.getElementById('srv-name').value,
-                    ip:   document.getElementById('srv-ip').value,
-                    mac:  document.getElementById('srv-mac').value,
-                }),
+                body: JSON.stringify(body),
             });
+            if (!res.ok) {
+                const err = await res.json();
+                alert(err.error || 'Failed to add server.');
+                return;
+            }
             addForm.reset();
+            document.getElementById('mac-field-wrap').style.display = ''; // reset MAC visibility
         });
 
         // ── Remove Server ─────────────────────────────────────────────────────
