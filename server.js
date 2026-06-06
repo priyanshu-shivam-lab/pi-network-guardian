@@ -65,6 +65,11 @@ const STABLE_ONLINE_MS  = 5 * 60_000; // 5 minutes of continuous uptime
 const CONFIRM_PINGS        = 9;
 const CONFIRM_INTERVAL_MS  = 1_000; // 1 second between each confirmation ping
 
+// After the gateway recovers, wait this long before re-pinging servers.
+// Prevents false WoL / alert emails caused by router reboots (e.g. firmware updates)
+// where servers were never actually offline – just temporarily unreachable.
+const RECOVERY_GRACE_MS = 2 * 60_000; // 2 minutes
+
 // Simple sleep helper
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -96,7 +101,7 @@ function buildTransporter() {
     });
 }
 
-// Send a queued outage-recovery email, listing all affected servers.
+// Send a queued outage-recovery email, listing servers confirmed still offline after the grace period.
 async function sendOutageRecoveryEmail(affectedServers, outageDuration) {
     const transporter = buildTransporter();
     if (!transporter) {
@@ -105,7 +110,7 @@ async function sendOutageRecoveryEmail(affectedServers, outageDuration) {
     }
 
     const serverList = affectedServers
-        .map(s => `  • ${s.name}  (IP: ${s.ip} | MAC: ${s.mac})  – was offline at outage start`)
+        .map(s => `  • ${s.name}  (IP: ${s.ip} | MAC: ${s.mac})  – still offline after recovery grace period`)
         .join('\n');
 
     const durationStr = outageDuration != null
@@ -116,11 +121,11 @@ async function sendOutageRecoveryEmail(affectedServers, outageDuration) {
         <div style="font-family:sans-serif;max-width:600px;margin:auto;background:#111827;color:#f9fafb;padding:24px;border-radius:12px;">
             <h2 style="color:#34d399;margin-top:0;">⚡ Pi Network Guardian – Power Outage Alert</h2>
             <p>A <strong>power outage</strong> was detected on your network. The gateway was unreachable for <strong>${durationStr}</strong>.</p>
-            <p>The following servers were offline when the outage began and have been queued for Wake-on-LAN:</p>
+            <p>After the gateway recovered, the following servers were <strong>still offline after a 2-minute verification window</strong> and have been sent Wake-on-LAN packets:</p>
             <ul style="background:#1f2937;padding:16px 16px 16px 32px;border-radius:8px;font-family:monospace;font-size:14px;">
                 ${affectedServers.map(s => `<li style="margin-bottom:6px;">${s.name} — IP: ${s.ip}</li>`).join('')}
             </ul>
-            <p>The gateway is now <strong style="color:#34d399;">back online</strong>. Wake-on-LAN packets have been (or are being) dispatched.</p>
+            <p>The gateway is now <strong style="color:#34d399;">back online</strong>. Wake-on-LAN packets have been dispatched to the servers listed above.</p>
             <hr style="border-color:#374151;margin:24px 0;">
             <p style="font-size:12px;color:#6b7280;">Sent by Pi Network Guardian at ${new Date().toLocaleString()}</p>
         </div>
@@ -130,13 +135,97 @@ async function sendOutageRecoveryEmail(affectedServers, outageDuration) {
         await transporter.sendMail({
             from: `"Pi Network Guardian" <${emailConfig.user}>`,
             to: emailConfig.adminTo,
-            subject: `⚡ [ALERT] Power Outage Detected & Resolved – ${affectedServers.length} server(s) affected`,
-            text: `Power outage detected. Gateway was down for ${durationStr}.\n\nAffected servers:\n${serverList}\n\nGateway is now back online. WoL packets have been dispatched.`,
+            subject: `⚡ [ALERT] Power Outage Resolved – ${affectedServers.length} server(s) still offline`,
+            text: `Power outage detected. Gateway was down for ${durationStr}.\n\nThe following servers were still offline after a 2-minute post-recovery check:\n${serverList}\n\nWoL packets have been dispatched.`,
             html,
         });
-        console.log(`[EMAIL] Outage alert sent to ${emailConfig.adminTo} (${affectedServers.length} server(s) affected)`);
+        console.log(`[EMAIL] Outage alert sent to ${emailConfig.adminTo} (${affectedServers.length} server(s) still offline after grace period)`);
     } catch (err) {
         console.error('[EMAIL] Failed to send outage alert:', err.message);
+    }
+}
+
+// Called when the gateway comes back online after an outage.
+// Waits RECOVERY_GRACE_MS then re-pings every pending server.
+// Only sends WoL / alert email for servers that are genuinely still offline.
+// This prevents false alerts caused by router reboots (e.g. firmware updates)
+// where servers were unreachable only because the gateway was temporarily down.
+async function handleGatewayRecovery(pendingServers, outageDuration) {
+    console.log(`[RECOVERY] Gateway restored. Waiting ${RECOVERY_GRACE_MS / 1000}s before verifying servers...`);
+
+    // Mark all waiting servers as 'verifying' so the UI shows they're being checked
+    for (const s of servers) {
+        if (s.status === 'waiting-for-power') s.status = 'verifying';
+    }
+    io.emit('status-update', servers);
+
+    await sleep(RECOVERY_GRACE_MS);
+
+    console.log('[RECOVERY] Grace period elapsed. Re-pinging servers to confirm actual status...');
+
+    const stillOffline = [];
+    for (const pending of pendingServers) {
+        const liveServer = servers.find(s => s.id === pending.id);
+        if (!liveServer) continue;
+
+        // Skip if the regular monitor already marked it back online during the grace period
+        if (liveServer.status === 'online') {
+            console.log(`[RECOVERY] ${liveServer.name} already marked online – skipping.`);
+            continue;
+        }
+
+        const result = await ping.promise.probe(liveServer.ip, { timeout: 2 });
+        if (result.alive) {
+            console.log(`[RECOVERY] ${liveServer.name} is responding – no WoL needed.`);
+            liveServer.status = 'online';
+            liveServer.lastOnlineAt = Date.now();
+            liveServer.alertedAt = null;
+        } else {
+            console.log(`[RECOVERY] ${liveServer.name} is still offline – will send WoL.`);
+            stillOffline.push(liveServer);
+        }
+    }
+
+    io.emit('status-update', servers);
+
+    if (stillOffline.length === 0) {
+        console.log('[RECOVERY] All servers came back on their own. No WoL sent. No alert email.');
+        return;
+    }
+
+    // Dispatch WoL only to servers confirmed still offline
+    const wolTargets = [];
+    for (const s of stillOffline) {
+        if (s.wolEnabled) {
+            const now = Date.now();
+            const cooldownExpired = !s.lastWolSentAt || (now - s.lastWolSentAt) >= WOL_COOLDOWN_MS;
+            if (cooldownExpired) {
+                console.log(`[WOL] ${s.name} still offline after grace period – sending Wake-on-LAN.`);
+                s.status = 'waking';
+                s.lastWolSentAt = now;
+                wol.wake(s.mac, (error) => {
+                    if (error) console.error(`WoL Error for ${s.name}:`, error);
+                });
+                wolTargets.push(s);
+            } else {
+                const retryIn = Math.round((WOL_COOLDOWN_MS - (now - s.lastWolSentAt)) / 1000);
+                console.log(`[WAIT] ${s.name} WoL cooldown active – retry in ${retryIn}s.`);
+                s.status = 'waking';
+            }
+        } else {
+            s.status = 'alerted';
+            if (!s.alertedAt) {
+                s.alertedAt = Date.now();
+                sendServerDownEmail(s);
+            }
+        }
+    }
+
+    io.emit('status-update', servers);
+
+    // Send the outage recovery email only for servers that actually needed WoL
+    if (wolTargets.length > 0) {
+        sendOutageRecoveryEmail(wolTargets, outageDuration);
     }
 }
 
@@ -353,14 +442,17 @@ async function monitorServers() {
     // ── GATEWAY IS ALIVE ──────────────────────────────────────────────────
     if (gatewayWasDown) {
         const outageDuration = outageStartTime ? Date.now() - outageStartTime : null;
-        console.log(`[POWER RESTORED] Gateway is back online after ${outageDuration != null ? Math.round(outageDuration / 1000) + 's' : 'unknown duration'}. Sending queued email alert...`);
+        console.log(`[POWER RESTORED] Gateway is back online after ${outageDuration != null ? Math.round(outageDuration / 1000) + 's' : 'unknown duration'}. Starting ${RECOVERY_GRACE_MS / 1000}s verification window before sending WoL/alerts...`);
         gatewayWasDown = false;
-        if (pendingOutageAlerts.length > 0) {
-            sendOutageRecoveryEmail(pendingOutageAlerts, outageDuration);
-            pendingOutageAlerts = [];
-        }
-        io.emit('gateway-status', { alive: true, outageStartTime: null });
         outageStartTime = null;
+        io.emit('gateway-status', { alive: true, outageStartTime: null });
+
+        if (pendingOutageAlerts.length > 0) {
+            const pending = [...pendingOutageAlerts];
+            pendingOutageAlerts = [];
+            // Fire-and-forget: waits 2 min, re-pings servers, only acts on genuinely offline ones
+            handleGatewayRecovery(pending, outageDuration);
+        }
     }
 
     // ── PER-SERVER PING ───────────────────────────────────────────────────
