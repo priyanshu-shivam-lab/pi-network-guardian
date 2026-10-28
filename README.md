@@ -13,7 +13,7 @@ A lightweight Node.js server monitor designed to run on a **Raspberry Pi** (or a
 | **Real-time dashboard** | Live server status cards updated via WebSocket (Socket.IO) |
 | **9-ping confirmation** | A failed ping triggers 9 more pings (1/sec) before marking a server down — eliminates false alarms from transient blips |
 | **Power outage detection** | Gateway is checked every 2 seconds; if it goes down, all servers switch to "Waiting for Power" |
-| **Wake-on-LAN** | Sends a WoL magic packet to offline servers when the gateway is alive; respects a 60-second cooldown and a 5-minute stability timer to avoid spamming flapping devices |
+| **Wake-on-LAN** | Sends a WoL magic packet to offline servers when the gateway is alive; respects a 60-second cooldown and a 5-minute stability timer to avoid spamming flapping devices. If a server hasn't woken after `WOL_GIVE_UP_MIN` (default 10), WoL stops and the admin is emailed that it needs manual intervention |
 | **Deferred email alerts** | Email cannot be sent during an outage (no gateway). The alert is queued and dispatched the moment the gateway comes back online |
 | **Persistent server list** | Servers are saved to `servers.json` and survive restarts |
 | **In-browser SMTP config** | Configure email settings and send a test email without touching config files |
@@ -28,6 +28,7 @@ A lightweight Node.js server monitor designed to run on a **Raspberry Pi** (or a
 | 🟢 **ONLINE** | Server is reachable |
 | 🔍 **VERIFYING…** | First ping failed; running 9 confirmation pings |
 | ⚡ **SENDING WOL** | Confirmed offline; Wake-on-LAN packet dispatched |
+| 🔴 **WOL FAILED – MANUAL ACTION** | WoL didn't wake the server within `WOL_GIVE_UP_MIN`; admin emailed, WoL stopped until it comes back |
 | 🔌 **POWER LOSS** | Gateway is down; server is waiting for power restoration |
 
 ---
@@ -79,6 +80,9 @@ ADMIN_EMAIL=admin@yourdomain.com
 
 # Minutes your servers' own shutdown script waits with the gateway unreachable
 SERVER_SHUTDOWN_AFTER_MIN=5
+
+# Stop WoL and email the admin if a server hasn't woken after this many minutes
+WOL_GIVE_UP_MIN=10
 ```
 
 > **Gmail users:** Generate an App Password at [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords). Do **not** use your Gmail account password.

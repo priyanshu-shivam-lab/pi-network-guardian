@@ -266,7 +266,9 @@
                     <div>
                         <div class="flex justify-between items-start mb-3">
                             <h3 class="text-base font-bold text-white">${srv.name}</h3>
-                            ${makeBadge(srv.status)}
+                            ${srv.status === 'alerted' && srv.wolEnabled
+                                ? `<span class="px-2 py-1 text-xs rounded-md bg-red-900/60 text-red-300 font-semibold border border-red-700/60 animate-pulse-slow">🔴 WOL FAILED – MANUAL ACTION</span>`
+                                : makeBadge(srv.status)}
                         </div>
                         <p class="text-xs text-gray-500 font-mono mb-1">IP:&nbsp; <span class="text-gray-300">${srv.ip}</span></p>
                         ${macRow}
@@ -474,7 +476,7 @@
             online:              { label: 'Online',                       color: '#10b981' },
             verifying:           { label: 'Verifying (ping failed)',      color: '#f97316' },
             waking:              { label: 'Down – WoL sent',              color: '#eab308' },
-            alerted:             { label: 'Down – admin emailed',         color: '#dc2626' },
+            alerted:             { label: 'Down – needs manual action',   color: '#dc2626' },
             'waiting-for-power': { label: 'Not checked – gateway down',   color: '#8b5cf6' },
             'assumed-up':        { label: 'Up on UPS (inferred)',         color: '#047857', inferred: true },
             shutdown:            { label: 'Shut down (inferred)',         color: '#4f46e5', inferred: true },
@@ -748,6 +750,7 @@
                     return ['🖥️', `${esc(ev.name)}: ${st.label}`, cls];
                 }
                 case 'wol-sent':        return ['⚡', `Wake-on-LAN sent to ${esc(ev.name)}.`, 'text-yellow-300'];
+                case 'wol-gave-up':     return ['🛑', `${esc(ev.name)} did not wake after ${fmtDur(ev.afterMs)} of Wake-on-LAN – manual intervention needed. WoL stopped.`, 'text-red-300'];
                 case 'email-sent':      return ['✉️', `Email sent: ${esc(ev.subject)}`, 'text-blue-300'];
                 case 'server-added':    return ['➕', `Server added: ${esc(ev.name)} (${esc(ev.ip)})`, 'text-gray-400'];
                 case 'server-removed':  return ['➖', `Server removed: ${esc(ev.name)}`, 'text-gray-400'];

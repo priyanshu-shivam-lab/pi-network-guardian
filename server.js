@@ -61,6 +61,9 @@ const WOL_COOLDOWN_MS   = 60_000;  // 1 minute between WoL attempts
 // How long a server must stay online before its WoL cooldown is reset (prevents
 // rapid WoL spam on flapping devices like phones/tablets that wake and sleep)
 const STABLE_ONLINE_MS  = 5 * 60_000; // 5 minutes of continuous uptime
+// Stop sending WoL if the server still hasn't come up this long after the first packet,
+// and alert the admin that it needs manual intervention (dead hardware, WoL off in BIOS…)
+const WOL_GIVE_UP_MS    = (parseFloat(process.env.WOL_GIVE_UP_MIN) || 10) * 60_000;
 
 // Confirmation ping settings: on first failure, run this many extra pings before declaring the server down
 const CONFIRM_PINGS        = 9;
@@ -89,7 +92,7 @@ function publishStatus() {
     for (const s of servers) {
         const prev = lastRecordedStatus.get(s.id);
         // A server that is already down gets re-verified every cycle; don't log that churn
-        if (DOWN_STATES.has(prev) && (s.status === 'verifying' || DOWN_STATES.has(s.status))) continue;
+        if (DOWN_STATES.has(prev) && s.status === 'verifying') continue;
         if (s.status !== prev && s.status !== 'checking') {
             history.record('server-status', { id: s.id, name: s.name, from: prev ?? null, to: s.status });
         }
@@ -103,10 +106,38 @@ function sendWol(s) {
     s.status = 'waking';
     s.lastWolSentAt = Date.now();
     s.lastWolMono = performance.now();
+    if (s.wakeStartedMono == null) s.wakeStartedMono = s.lastWolMono; // first packet of this down period
     wol.wake(s.mac, (error) => {
         if (error) console.error(`WoL Error for ${s.name}:`, error);
     });
     history.record('wol-sent', { id: s.id, name: s.name });
+}
+
+// For a confirmed-down WoL server: send WoL (respecting the cooldown), or give up and
+// alert the admin once WOL_GIVE_UP_MS has passed since the first packet. Returns true if a packet was sent.
+function wakeOrEscalate(s) {
+    // Monotonic clock: an NTP jump after boot must not trigger an instant give-up
+    if (s.wakeStartedMono != null && performance.now() - s.wakeStartedMono >= WOL_GIVE_UP_MS) {
+        s.status = 'alerted';
+        if (!s.alertedAt) {
+            s.alertedAt = Date.now();
+            console.log(`[GIVE UP] ${s.name} did not wake within ${WOL_GIVE_UP_MS / 60000} min of WoL. Manual intervention needed.`);
+            history.record('wol-gave-up', { id: s.id, name: s.name, afterMs: WOL_GIVE_UP_MS });
+            sendServerDownEmail(s);
+        }
+        return false;
+    }
+    const now = Date.now();
+    const cooldownExpired = !s.lastWolSentAt || (now - s.lastWolSentAt) >= WOL_COOLDOWN_MS;
+    if (cooldownExpired) {
+        console.log(`[WOL] ${s.name} is down. Sending Wake-on-LAN...`);
+        sendWol(s);
+        return true;
+    }
+    const retryIn = Math.round((WOL_COOLDOWN_MS - (now - s.lastWolSentAt)) / 1000);
+    console.log(`[WAIT] ${s.name} still offline. WoL cooldown active – retry in ${retryIn}s.`);
+    s.status = 'waking';
+    return false;
 }
 
 // --- Email Configuration (loaded from .env, editable via API) ---
@@ -217,6 +248,7 @@ async function handleGatewayRecovery(pendingServers, outageDuration) {
             liveServer.status = 'online';
             liveServer.lastOnlineAt = Date.now();
             liveServer.alertedAt = null;
+            liveServer.wakeStartedMono = null;
         } else {
             console.log(`[RECOVERY] ${liveServer.name} is still offline – will send WoL.`);
             stillOffline.push(liveServer);
@@ -234,17 +266,8 @@ async function handleGatewayRecovery(pendingServers, outageDuration) {
     const wolTargets = [];
     for (const s of stillOffline) {
         if (s.wolEnabled) {
-            const now = Date.now();
-            const cooldownExpired = !s.lastWolSentAt || (now - s.lastWolSentAt) >= WOL_COOLDOWN_MS;
-            if (cooldownExpired) {
-                console.log(`[WOL] ${s.name} still offline after grace period – sending Wake-on-LAN.`);
-                sendWol(s);
-                wolTargets.push(s);
-            } else {
-                const retryIn = Math.round((WOL_COOLDOWN_MS - (now - s.lastWolSentAt)) / 1000);
-                console.log(`[WAIT] ${s.name} WoL cooldown active – retry in ${retryIn}s.`);
-                s.status = 'waking';
-            }
+            s.wakeStartedMono = null; // new outage → fresh WoL attempt window
+            if (wakeOrEscalate(s)) wolTargets.push(s);
         } else {
             s.status = 'alerted';
             if (!s.alertedAt) {
@@ -418,13 +441,17 @@ history.clockReady.then(() => {
     if (outage) assessOutage('power', { startAt: outage.start });
 });
 
-// Send an immediate alert email when a non-WoL server is confirmed down.
+// Send an alert email when a server is down and needs manual intervention:
+// either WoL is disabled, or WoL was tried for WOL_GIVE_UP_MS without success.
 async function sendServerDownEmail(s) {
     const transporter = buildTransporter();
     if (!transporter) {
         console.warn(`[EMAIL] SMTP not configured. Skipping down-alert for ${s.name}.`);
         return;
     }
+    const wolText = s.wolEnabled
+        ? `Enabled – no response after ${WOL_GIVE_UP_MS / 60000} min of attempts (check hardware / BIOS WoL setting)`
+        : 'Disabled – no automatic recovery';
     const html = `
         <div style="font-family:sans-serif;max-width:600px;margin:auto;background:#111827;color:#f9fafb;padding:24px;border-radius:12px;">
             <h2 style="color:#f87171;margin-top:0;">🔴 Pi Network Guardian – Server Down Alert</h2>
@@ -432,7 +459,7 @@ async function sendServerDownEmail(s) {
             <table style="width:100%;background:#1f2937;border-radius:8px;padding:16px;font-family:monospace;font-size:14px;border-collapse:collapse;">
                 <tr><td style="color:#9ca3af;padding:4px 8px;">Name</td><td style="color:#f9fafb;padding:4px 8px;">${s.name}</td></tr>
                 <tr><td style="color:#9ca3af;padding:4px 8px;">IP Address</td><td style="color:#f9fafb;padding:4px 8px;">${s.ip}</td></tr>
-                <tr><td style="color:#9ca3af;padding:4px 8px;">Wake-on-LAN</td><td style="color:#f87171;padding:4px 8px;">Disabled – no automatic recovery</td></tr>
+                <tr><td style="color:#9ca3af;padding:4px 8px;">Wake-on-LAN</td><td style="color:#f87171;padding:4px 8px;">${wolText}</td></tr>
                 <tr><td style="color:#9ca3af;padding:4px 8px;">Detected at</td><td style="color:#f9fafb;padding:4px 8px;">${new Date().toLocaleString()}</td></tr>
             </table>
             <p style="margin-top:16px;">Please check the device manually. The monitor will notify you again when it comes back online.</p>
@@ -445,10 +472,10 @@ async function sendServerDownEmail(s) {
             from: `"Pi Network Guardian" <${emailConfig.user}>`,
             to: emailConfig.adminTo,
             subject: `🔴 [DOWN] ${s.name} is offline – manual action required`,
-            text: `Server Down Alert\n\nName: ${s.name}\nIP: ${s.ip}\nWake-on-LAN: Disabled\nDetected: ${new Date().toLocaleString()}\n\nPlease check the device manually.`,
+            text: `Server Down Alert\n\nName: ${s.name}\nIP: ${s.ip}\nWake-on-LAN: ${wolText}\nDetected: ${new Date().toLocaleString()}\n\nPlease check the device manually.`,
             html,
         });
-        console.log(`[EMAIL] Server-down alert sent for ${s.name} (WoL disabled).`);
+        console.log(`[EMAIL] Server-down alert sent for ${s.name}.`);
         history.record('email-sent', { subject: `${s.name} is offline`, servers: [s.name] });
     } catch (err) {
         console.error(`[EMAIL] Failed to send server-down alert for ${s.name}:`, err.message);
@@ -472,17 +499,8 @@ async function handleConfirmedDown(s) {
         }
         s.status = 'waiting-for-power';
     } else if (s.wolEnabled) {
-        // ── WoL ENABLED: send magic packet ──────────────────────────────────
-        const now = Date.now();
-        const cooldownExpired = !s.lastWolSentAt || (now - s.lastWolSentAt) >= WOL_COOLDOWN_MS;
-        if (cooldownExpired) {
-            console.log(`[WOL] ${s.name} confirmed down. Gateway up. Sending Wake-on-LAN...`);
-            sendWol(s);
-        } else {
-            const retryIn = Math.round((WOL_COOLDOWN_MS - (now - s.lastWolSentAt)) / 1000);
-            console.log(`[WAIT] ${s.name} still offline. WoL cooldown active – retry in ${retryIn}s.`);
-            s.status = 'waking';
-        }
+        // ── WoL ENABLED: send magic packet, or give up and alert after WOL_GIVE_UP_MS ──
+        wakeOrEscalate(s);
     } else {
         // ── WoL DISABLED: alert admin by email ──────────────────────────────
         s.status = 'alerted';
@@ -524,6 +542,7 @@ async function runConfirmationPings(s) {
             console.log(`[VERIFY] ${s.name} recovered on confirmation ping ${i}/${CONFIRM_PINGS}. Treating as online (false alarm).`);
             s.status = 'online';
             s.lastOnlineAt = Date.now(); // start stability timer; don't clear WoL cooldown yet
+            s.wakeStartedMono = null;
             s.confirming = false;
             publishStatus();
             return true; // false alarm – server is fine
@@ -584,8 +603,8 @@ async function monitorServers() {
         if (isAlive.alive) {
             if (s.status !== 'online') {
                 console.log(`[RECOVERED] ${s.name} is back online.`);
-                // If we had alerted (non-WoL server was down), send a recovery notification
-                if (!s.wolEnabled && s.alertedAt) {
+                // If we had alerted (manual intervention needed), send a recovery notification
+                if (s.alertedAt) {
                     const transporter = buildTransporter();
                     if (transporter) {
                         transporter.sendMail({
@@ -601,6 +620,7 @@ async function monitorServers() {
             }
             s.status = 'online';
             s.alertedAt = null; // reset so next outage triggers a fresh email
+            s.wakeStartedMono = null;
             // Only reset the WoL cooldown once the server has been stably online
             // for STABLE_ONLINE_MS – prevents rapid WoL blasts on flapping devices.
             if (!s.lastOnlineAt) s.lastOnlineAt = Date.now();
@@ -609,6 +629,10 @@ async function monitorServers() {
                 s.lastWolSentAt = null;
                 s.lastOnlineAt  = null;
             }
+        } else if (s.status === 'alerted') {
+            // Already reported as needing manual intervention – keep pinging so we notice
+            // when it's back, but don't re-run the confirmation pings every cycle
+            continue;
         } else {
             // First ping failed – start confirmation window asynchronously
             // so this loop doesn't block waiting 9 seconds per server
