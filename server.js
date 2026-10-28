@@ -7,6 +7,7 @@ const wol = require('wake_on_lan');
 const nodemailer = require('nodemailer');
 const fs = require('fs');
 const path = require('path');
+const history = require('./events');
 
 const app = express();
 const server = http.createServer(app);
@@ -70,8 +71,43 @@ const CONFIRM_INTERVAL_MS  = 1_000; // 1 second between each confirmation ping
 // where servers were never actually offline – just temporarily unreachable.
 const RECOVERY_GRACE_MS = 2 * 60_000; // 2 minutes
 
+// The servers run their own script that shuts them down once the gateway has been
+// unreachable for this long. Used to infer from outage length whether they shut down.
+const SERVER_SHUTDOWN_AFTER_MS = (parseFloat(process.env.SERVER_SHUTDOWN_AFTER_MIN) || 5) * 60_000;
+
+// Gateway outages shorter than this are not assessed (single dropped pings etc.)
+const MIN_ASSESS_OUTAGE_MS = 60_000;
+
 // Simple sleep helper
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// --- History: record server state changes and broadcast status ---
+const lastRecordedStatus = new Map(); // server id -> last status written to history
+const DOWN_STATES = new Set(['waking', 'alerted']);
+
+function publishStatus() {
+    for (const s of servers) {
+        const prev = lastRecordedStatus.get(s.id);
+        // A server that is already down gets re-verified every cycle; don't log that churn
+        if (DOWN_STATES.has(prev) && (s.status === 'verifying' || DOWN_STATES.has(s.status))) continue;
+        if (s.status !== prev && s.status !== 'checking') {
+            history.record('server-status', { id: s.id, name: s.name, from: prev ?? null, to: s.status });
+        }
+        lastRecordedStatus.set(s.id, s.status);
+    }
+    io.emit('status-update', servers);
+}
+
+// Send a WoL magic packet and record it. Callers handle the cooldown check.
+function sendWol(s) {
+    s.status = 'waking';
+    s.lastWolSentAt = Date.now();
+    s.lastWolMono = performance.now();
+    wol.wake(s.mac, (error) => {
+        if (error) console.error(`WoL Error for ${s.name}:`, error);
+    });
+    history.record('wol-sent', { id: s.id, name: s.name });
+}
 
 // --- Email Configuration (loaded from .env, editable via API) ---
 let emailConfig = {
@@ -140,6 +176,7 @@ async function sendOutageRecoveryEmail(affectedServers, outageDuration) {
             html,
         });
         console.log(`[EMAIL] Outage alert sent to ${emailConfig.adminTo} (${affectedServers.length} server(s) still offline after grace period)`);
+        history.record('email-sent', { subject: 'Power outage resolved', servers: affectedServers.map(s => s.name) });
     } catch (err) {
         console.error('[EMAIL] Failed to send outage alert:', err.message);
     }
@@ -157,7 +194,7 @@ async function handleGatewayRecovery(pendingServers, outageDuration) {
     for (const s of servers) {
         if (s.status === 'waiting-for-power') s.status = 'verifying';
     }
-    io.emit('status-update', servers);
+    publishStatus();
 
     await sleep(RECOVERY_GRACE_MS);
 
@@ -186,7 +223,7 @@ async function handleGatewayRecovery(pendingServers, outageDuration) {
         }
     }
 
-    io.emit('status-update', servers);
+    publishStatus();
 
     if (stillOffline.length === 0) {
         console.log('[RECOVERY] All servers came back on their own. No WoL sent. No alert email.');
@@ -201,11 +238,7 @@ async function handleGatewayRecovery(pendingServers, outageDuration) {
             const cooldownExpired = !s.lastWolSentAt || (now - s.lastWolSentAt) >= WOL_COOLDOWN_MS;
             if (cooldownExpired) {
                 console.log(`[WOL] ${s.name} still offline after grace period – sending Wake-on-LAN.`);
-                s.status = 'waking';
-                s.lastWolSentAt = now;
-                wol.wake(s.mac, (error) => {
-                    if (error) console.error(`WoL Error for ${s.name}:`, error);
-                });
+                sendWol(s);
                 wolTargets.push(s);
             } else {
                 const retryIn = Math.round((WOL_COOLDOWN_MS - (now - s.lastWolSentAt)) / 1000);
@@ -221,7 +254,7 @@ async function handleGatewayRecovery(pendingServers, outageDuration) {
         }
     }
 
-    io.emit('status-update', servers);
+    publishStatus();
 
     // Send the outage recovery email only for servers that actually needed WoL
     if (wolTargets.length > 0) {
@@ -246,11 +279,14 @@ app.post('/api/servers', (req, res) => {
     };
     servers.push(newServer);
     saveServers();
+    history.record('server-added', { id: newServer.id, name, ip });
     res.json(newServer);
 });
 
 app.delete('/api/servers/:id', (req, res) => {
     const id = parseInt(req.params.id);
+    const removed = servers.find(s => s.id === id);
+    if (removed) history.record('server-removed', { id, name: removed.name });
     servers = servers.filter(s => s.id !== id);
     saveServers();
     res.json({ success: true });
@@ -293,11 +329,94 @@ app.post('/api/config/email/test', async (req, res) => {
     }
 });
 
+// --- History API ---
+app.get('/api/history', (req, res) => {
+    res.json({
+        events:          history.readAll(),
+        servers:         servers.map(({ id, name }) => ({ id, name })),
+        shutdownAfterMs: SERVER_SHUTDOWN_AFTER_MS,
+        clockSynced:     history.isSynced(),
+        now:             Date.now(),
+    });
+});
+
 // --- Core Monitoring Logic ---
+let lastGatewayAlive    = null;  // last gateway state recorded to history (null = not checked yet)
+let gatewayUpSinceMono  = null;  // performance.now() when the gateway last came up
+let gatewayDownSinceMono = null; // performance.now() when the gateway last went down
+let gatewayDownAtStart  = false; // first check after startup failed → tail of a power outage, not a router outage
+
 async function checkGateway() {
     const res = await ping.promise.probe(GATEWAY_IP, { timeout: 2 });
+    if (res.alive !== lastGatewayAlive) {
+        history.record('gateway', { alive: res.alive });
+        if (lastGatewayAlive === null && !res.alive) gatewayDownAtStart = true;
+        const now = performance.now();
+        if (res.alive) {
+            gatewayUpSinceMono = now;
+            const downMs = gatewayDownSinceMono !== null ? now - gatewayDownSinceMono : 0;
+            if (gatewayDownAtStart) {
+                gatewayDownAtStart = false; // the boot-time power outage assessment covers this one
+            } else if (downMs >= MIN_ASSESS_OUTAGE_MS) {
+                assessOutage('router', { startMono: gatewayDownSinceMono });
+            }
+            gatewayDownSinceMono = null;
+        } else {
+            gatewayDownSinceMono = now;
+            gatewayUpSinceMono = null;
+        }
+        lastGatewayAlive = res.alive;
+    }
     return res.alive;
 }
+
+// After a gateway outage, classify each server by whether its own shutdown script
+// should have fired (gateway unreachable ≥ SERVER_SHUTDOWN_AFTER_MS) and whether it
+// was reachable once the gateway had been back for RECOVERY_GRACE_MS.
+async function assessOutage(kind, { startAt, startMono }) {
+    await history.clockReady;
+    while (gatewayUpSinceMono === null || performance.now() - gatewayUpSinceMono < RECOVERY_GRACE_MS) {
+        await sleep(2_000);
+    }
+    const gatewayBackMono = gatewayUpSinceMono;
+    const gatewayBackAt   = history.wallFromMono(gatewayBackMono);
+    const start           = startAt ?? history.wallFromMono(startMono);
+    const gatewayDownMs   = gatewayBackAt - start;
+
+    // A power outage's start comes from the heartbeat, so the real start may be up to one heartbeat later
+    const margin    = kind === 'power' ? history.HEARTBEAT_MS : 0;
+    const exceeded  = gatewayDownMs - margin >= SERVER_SHUTDOWN_AFTER_MS;
+    const uncertain = !exceeded && gatewayDownMs >= SERVER_SHUTDOWN_AFTER_MS;
+
+    const results = [];
+    for (const s of servers) {
+        // A server we've already had to wake since the gateway came back was down, even if it's up now
+        const wokenSinceBack = s.lastWolMono != null && s.lastWolMono >= gatewayBackMono;
+        let reachable = false;
+        for (let i = 0; i < 3 && !reachable && !wokenSinceBack; i++) {
+            reachable = (await ping.promise.probe(s.ip, { timeout: 1 })).alive;
+        }
+        let verdict;
+        if (uncertain)     verdict = 'uncertain';
+        else if (exceeded) verdict = reachable ? 'stayed-up-unexpected' : 'shutdown';
+        else               verdict = reachable ? 'rode-through' : 'down-other';
+        results.push({ id: s.id, name: s.name, verdict, reachable });
+    }
+
+    console.log(`[HISTORY] ${kind} outage assessed: gateway down ${Math.round(gatewayDownMs / 1000)}s – ` +
+        results.map(r => `${r.name}: ${r.verdict}`).join(', '));
+    history.record('outage-assessment', {
+        kind, start, gatewayBackAt, gatewayDownMs,
+        shutdownAfterMs: SERVER_SHUTDOWN_AFTER_MS,
+        servers: results,
+    });
+}
+
+// If the Pi was off (power cut), assess the servers once the gateway is back.
+history.clockReady.then(() => {
+    const outage = history.takePowerOutage();
+    if (outage) assessOutage('power', { startAt: outage.start });
+});
 
 // Send an immediate alert email when a non-WoL server is confirmed down.
 async function sendServerDownEmail(s) {
@@ -330,6 +449,7 @@ async function sendServerDownEmail(s) {
             html,
         });
         console.log(`[EMAIL] Server-down alert sent for ${s.name} (WoL disabled).`);
+        history.record('email-sent', { subject: `${s.name} is offline`, servers: [s.name] });
     } catch (err) {
         console.error(`[EMAIL] Failed to send server-down alert for ${s.name}:`, err.message);
     }
@@ -357,11 +477,7 @@ async function handleConfirmedDown(s) {
         const cooldownExpired = !s.lastWolSentAt || (now - s.lastWolSentAt) >= WOL_COOLDOWN_MS;
         if (cooldownExpired) {
             console.log(`[WOL] ${s.name} confirmed down. Gateway up. Sending Wake-on-LAN...`);
-            s.status = 'waking';
-            s.lastWolSentAt = now;
-            wol.wake(s.mac, (error) => {
-                if (error) console.error(`WoL Error for ${s.name}:`, error);
-            });
+            sendWol(s);
         } else {
             const retryIn = Math.round((WOL_COOLDOWN_MS - (now - s.lastWolSentAt)) / 1000);
             console.log(`[WAIT] ${s.name} still offline. WoL cooldown active – retry in ${retryIn}s.`);
@@ -380,7 +496,7 @@ async function handleConfirmedDown(s) {
         }
     }
 
-    io.emit('status-update', servers);
+    publishStatus();
 }
 
 // Run CONFIRM_PINGS extra pings (1/sec) after a first failure.
@@ -388,7 +504,7 @@ async function handleConfirmedDown(s) {
 async function runConfirmationPings(s) {
     s.confirming = true;
     s.status = 'verifying';
-    io.emit('status-update', servers);
+    publishStatus();
     console.log(`[VERIFY] ${s.name} failed first ping. Running ${CONFIRM_PINGS} confirmation pings...`);
 
     for (let i = 1; i <= CONFIRM_PINGS; i++) {
@@ -399,7 +515,7 @@ async function runConfirmationPings(s) {
             console.log(`[VERIFY] ${s.name} – outage detected mid-confirmation. Aborting verification.`);
             s.confirming = false;
             s.status = 'waiting-for-power';
-            io.emit('status-update', servers);
+            publishStatus();
             return true; // don't double-process via handleConfirmedDown
         }
 
@@ -409,7 +525,7 @@ async function runConfirmationPings(s) {
             s.status = 'online';
             s.lastOnlineAt = Date.now(); // start stability timer; don't clear WoL cooldown yet
             s.confirming = false;
-            io.emit('status-update', servers);
+            publishStatus();
             return true; // false alarm – server is fine
         }
         console.log(`[VERIFY] ${s.name} still down (${i}/${CONFIRM_PINGS})...`);
@@ -434,7 +550,7 @@ async function monitorServers() {
             s.confirming = false; // cancel any in-progress confirmation
             s.status = 'waiting-for-power';
         }
-        io.emit('status-update', servers);
+        publishStatus();
         io.emit('gateway-status', { alive: false, outageStartTime });
         return;
     }
@@ -479,6 +595,7 @@ async function monitorServers() {
                             text: `Good news! ${s.name} (${s.ip}) is back online as of ${new Date().toLocaleString()}.`,
                         }).catch(err => console.error(`[EMAIL] Recovery notice failed for ${s.name}:`, err.message));
                         console.log(`[EMAIL] Recovery notice sent for ${s.name}.`);
+                        history.record('email-sent', { subject: `${s.name} is back online`, servers: [s.name] });
                     }
                 }
             }
@@ -501,7 +618,7 @@ async function monitorServers() {
         }
     }
 
-    io.emit('status-update', servers);
+    publishStatus();
 }
 
 async function checkGatewayOnly() {
@@ -534,3 +651,16 @@ io.on('connection', (socket) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`Pi Network Guardian running on http://localhost:${PORT}`));
+
+// --- History lifecycle ---
+history.onEvent(ev => io.emit('history-event', ev));
+history.start();
+
+// pm2 reload and system shutdown send SIGINT/SIGTERM. Marking the heartbeat as a clean
+// stop means a deliberate reboot isn't later mistaken for a power cut.
+for (const sig of ['SIGINT', 'SIGTERM']) {
+    process.on(sig, () => {
+        history.markCleanStop();
+        process.exit(0);
+    });
+}

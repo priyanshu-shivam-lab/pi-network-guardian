@@ -42,6 +42,16 @@
         #gateway-card.gw-offline { border-color:#6d28d9; box-shadow:0 0 0 0px #6d28d9, 0 4px 20px rgba(167,139,250,.15); }
 
         #outage-banner { display: none; }
+
+        /* History timeline */
+        .tl-track { position:relative; height:18px; background:#1f2937; border-radius:4px; overflow:hidden; }
+        .tl-seg   { position:absolute; top:0; bottom:0; min-width:2px; }
+        .tl-seg:hover { filter:brightness(1.25); }
+        .tl-mark  { position:absolute; top:-2px; bottom:-2px; width:2px; margin-left:-1px; background:#fde047; box-shadow:0 0 0 1px #111827; }
+        .tl-nodata   { background:repeating-linear-gradient(135deg,#1f2937 0 4px,#374151 4px 8px); }
+        .tl-inferred { background-image:repeating-linear-gradient(135deg,rgba(17,24,39,.35) 0 3px,transparent 3px 7px); }
+        #hist-range button { padding:4px 10px; border-radius:6px; color:#9ca3af; transition:.15s; }
+        #hist-range button.active { background:#374151; color:#fff; }
     </style>
 </head>
 
@@ -107,6 +117,32 @@
 
         <!-- Server Grid -->
         <div id="server-grid" class="grid grid-cols-1 md:grid-cols-2 gap-5 mb-8"></div>
+
+        <!-- History -->
+        <section class="bg-gray-900 rounded-xl p-5 sm:p-6 border border-gray-800 mb-6">
+            <div class="flex flex-wrap items-start justify-between gap-3 mb-5">
+                <div>
+                    <h2 class="text-sm font-semibold text-gray-400 uppercase tracking-wider">History</h2>
+                    <p id="hist-sub" class="text-xs text-gray-600 mt-1">Power, gateway and server state over time</p>
+                </div>
+                <div id="hist-range" class="flex bg-gray-800 border border-gray-700 rounded-lg p-0.5 text-xs font-medium">
+                    <button data-hours="6">6h</button>
+                    <button data-hours="24">24h</button>
+                    <button data-hours="168">7d</button>
+                </div>
+            </div>
+
+            <div id="hist-timeline"></div>
+            <div id="hist-legend" class="flex flex-wrap gap-x-4 gap-y-1.5 mt-4 text-xs text-gray-500"></div>
+
+            <h3 class="text-xs font-semibold text-gray-500 uppercase tracking-wider mt-7 mb-3">Outages</h3>
+            <div id="hist-outages" class="grid grid-cols-1 md:grid-cols-2 gap-3"></div>
+
+            <h3 class="text-xs font-semibold text-gray-500 uppercase tracking-wider mt-7 mb-3">Event log</h3>
+            <div id="hist-log" class="max-h-96 overflow-y-auto rounded-lg border border-gray-800 divide-y divide-gray-800/80"></div>
+        </section>
+
+        <div id="hist-tip" class="hidden fixed z-50 pointer-events-none max-w-xs bg-gray-950 border border-gray-700 rounded-lg px-3 py-2 text-xs text-gray-200 shadow-xl whitespace-pre-line"></div>
 
         <!-- Add Server Form -->
         <div class="bg-gray-900 rounded-xl p-6 border border-gray-800 mb-6">
@@ -427,6 +463,384 @@
             el.textContent = msg;
             el.className = `text-xs text-center min-h-[16px] ${cls}`;
         }
+
+        // ── History ───────────────────────────────────────────────────────────
+        const STATES = {
+            'power-on':          { label: 'Power on',                     color: '#10b981' },
+            'power-off':         { label: 'Power off (Pi was off)',       color: '#7c3aed' },
+            'pi-reboot':         { label: 'Pi rebooting',                 color: '#64748b' },
+            'gw-up':             { label: 'Gateway reachable',            color: '#10b981' },
+            'gw-down':           { label: 'Gateway unreachable',          color: '#ef4444' },
+            online:              { label: 'Online',                       color: '#10b981' },
+            verifying:           { label: 'Verifying (ping failed)',      color: '#f97316' },
+            waking:              { label: 'Down – WoL sent',              color: '#eab308' },
+            alerted:             { label: 'Down – admin emailed',         color: '#dc2626' },
+            'waiting-for-power': { label: 'Not checked – gateway down',   color: '#8b5cf6' },
+            'assumed-up':        { label: 'Up on UPS (inferred)',         color: '#047857', inferred: true },
+            shutdown:            { label: 'Shut down (inferred)',         color: '#4f46e5', inferred: true },
+            nodata:              { label: 'No data (monitor not running)', nodata: true },
+        };
+
+        const VERDICTS = {
+            shutdown:               { text: 'Shut down – power failure',        cls: 'bg-indigo-900/60 text-indigo-300 border-indigo-700/60' },
+            'rode-through':         { text: 'Stayed up on UPS',                 cls: 'bg-emerald-900/60 text-emerald-300 border-emerald-700/60' },
+            'stayed-up-unexpected': { text: 'Stayed up – expected shutdown',    cls: 'bg-amber-900/60 text-amber-300 border-amber-700/60' },
+            'down-other':           { text: 'Down – not explained by outage',   cls: 'bg-red-900/60 text-red-300 border-red-700/60' },
+            uncertain:              { text: 'Uncertain – outage ≈ shutdown time', cls: 'bg-gray-800 text-gray-300 border-gray-600' },
+        };
+
+        let histEvents   = [];
+        let histServers  = [];
+        let histShutdownAfterMs = 5 * 60_000;
+        let histHours    = 24;
+        try { histHours = parseInt(localStorage.getItem('histHours')) || 24; } catch {}
+
+        const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+        function fmtDur(ms) {
+            const s = Math.max(0, Math.round(ms / 1000));
+            if (s < 60) return `${s}s`;
+            const m = Math.floor(s / 60);
+            if (m < 60) return s % 60 ? `${m}m ${s % 60}s` : `${m}m`;
+            const h = Math.floor(m / 60);
+            if (h < 24) return `${h}h ${m % 60}m`;
+            return `${Math.floor(h / 24)}d ${h % 24}h`;
+        }
+        const fmtTime = (ts) => new Date(ts).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        const fmtShort = (ts) => new Date(ts).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' });
+
+        // Overwrite [from, to) of a row's segment list with a new state.
+        function paint(segs, from, to, state, note) {
+            if (!(to > from)) return;
+            const out = [];
+            for (const s of segs) {
+                if (s.to <= from || s.from >= to) { out.push(s); continue; }
+                if (s.from < from) out.push({ ...s, to: from });
+                if (s.to > to)     out.push({ ...s, from: to });
+            }
+            out.push({ from, to, state, note });
+            out.sort((a, b) => a.from - b.from);
+            segs.splice(0, segs.length, ...out);
+        }
+
+        // Walk all events and turn them into coloured segments per row (power, gateway, each server).
+        function buildTimeline(events, now) {
+            const rows = new Map();
+            const row = (key, label) => {
+                if (!rows.has(key)) rows.set(key, { key, label, segs: [], marks: [] });
+                const r = rows.get(key);
+                if (label) r.label = label;
+                return r;
+            };
+            row('power', 'Power');
+            row('gateway', 'Gateway');
+            for (const s of histServers) row('srv:' + s.id, s.name);
+
+            const open = new Map(); // row key -> { state, since }
+            const close = (key, at) => {
+                const o = open.get(key);
+                if (o && at > o.since) paint(row(key).segs, o.since, at, o.state);
+                open.delete(key);
+            };
+            const setState = (key, state, at) => { close(key, at); open.set(key, { state, since: at }); };
+            const serverKeys = () => [...rows.keys()].filter(k => k.startsWith('srv:'));
+
+            for (const ev of events) {
+                switch (ev.type) {
+                    case 'monitor-start': {
+                        const gapFrom = ev.lastSeen ?? ev.ts;
+                        for (const key of [...open.keys()]) close(key, gapFrom);
+                        if (ev.lastSeen) {
+                            for (const key of serverKeys()) paint(row(key).segs, gapFrom, ev.ts, 'nodata');
+                            if (ev.cause === 'power-outage') {
+                                paint(row('power').segs,   gapFrom, ev.bootAt, 'power-off');
+                                paint(row('power').segs,   ev.bootAt, ev.ts, 'power-on');
+                                paint(row('gateway').segs, gapFrom, ev.bootAt, 'gw-down', 'No power');
+                                paint(row('gateway').segs, ev.bootAt, ev.ts, 'nodata');
+                            } else if (ev.cause === 'pi-reboot') {
+                                paint(row('power').segs,   gapFrom, ev.ts, 'pi-reboot');
+                                paint(row('gateway').segs, gapFrom, ev.ts, 'nodata');
+                            } else {
+                                paint(row('power').segs,   gapFrom, ev.ts, 'nodata');
+                                paint(row('gateway').segs, gapFrom, ev.ts, 'nodata');
+                            }
+                        }
+                        setState('power', 'power-on', ev.ts);
+                        break;
+                    }
+                    case 'gateway':
+                        setState('gateway', ev.alive ? 'gw-up' : 'gw-down', ev.ts);
+                        break;
+                    case 'server-status':
+                        row('srv:' + ev.id, histServers.some(s => s.id === ev.id) ? null : ev.name);
+                        setState('srv:' + ev.id, ev.to, ev.ts);
+                        break;
+                    case 'server-added':
+                        row('srv:' + ev.id, histServers.some(s => s.id === ev.id) ? null : ev.name);
+                        break;
+                    case 'server-removed':
+                        close('srv:' + ev.id, ev.ts);
+                        row('srv:' + ev.id).label = `${ev.name} (removed)`;
+                        break;
+                    case 'wol-sent':
+                        row('srv:' + ev.id, histServers.some(s => s.id === ev.id) ? null : ev.name).marks.push({ ts: ev.ts, tip: `Wake-on-LAN sent\n${fmtTime(ev.ts)}` });
+                        break;
+                }
+            }
+            for (const key of [...open.keys()]) close(key, now);
+
+            // Overlay what the outage assessments inferred about the servers while we couldn't see them
+            for (const a of events.filter(e => e.type === 'outage-assessment')) {
+                for (const r of a.servers) {
+                    const segs = row('srv:' + r.id, histServers.some(s => s.id === r.id) ? null : r.name).segs;
+                    if (r.verdict === 'shutdown') {
+                        const offAt = a.start + a.shutdownAfterMs;
+                        const backOnline = events.find(e => e.type === 'server-status' && e.id === r.id && e.to === 'online' && e.ts > a.gatewayBackAt);
+                        paint(segs, a.start, offAt, 'assumed-up', 'Running on UPS until its shutdown script fired');
+                        paint(segs, offAt, backOnline ? backOnline.ts : now, 'shutdown', `Gateway unreachable ${fmtDur(a.gatewayDownMs)} (> ${fmtDur(a.shutdownAfterMs)})`);
+                    } else if (r.verdict === 'rode-through' || r.verdict === 'stayed-up-unexpected') {
+                        paint(segs, a.start, a.gatewayBackAt, 'assumed-up', VERDICTS[r.verdict].text);
+                    }
+                }
+            }
+            return [...rows.values()];
+        }
+
+        function renderTimeline(now) {
+            const from = now - histHours * 3_600_000;
+            const span = now - from;
+            const pct  = (ts) => ((Math.min(Math.max(ts, from), now) - from) / span) * 100;
+            const rows = buildTimeline(histEvents, now);
+            const firstTs = histEvents.length ? histEvents[0].ts : now;
+
+            const rowHtml = rows.map(r => {
+                // Before the very first event there is simply no history yet
+                const segs = [...r.segs];
+                if (firstTs > from) paint(segs, from, firstTs, 'nodata', 'Before history began');
+                const segHtml = segs.filter(s => s.to > from && s.from < now).map(s => {
+                    const st  = STATES[s.state] || { label: s.state, color: '#6b7280' };
+                    const cls = st.nodata ? 'tl-seg tl-nodata' : st.inferred ? 'tl-seg tl-inferred' : 'tl-seg';
+                    const bg  = st.nodata ? '' : `background-color:${st.color};`;
+                    const tip = `${st.label}${s.note ? '\n' + s.note : ''}\n${fmtTime(s.from)} → ${fmtTime(s.to)}\n${fmtDur(s.to - s.from)}`;
+                    return `<div class="${cls}" style="${bg}left:${pct(s.from)}%;width:${pct(s.to) - pct(s.from)}%" data-tip="${esc(tip)}"></div>`;
+                }).join('');
+                const markHtml = r.marks.filter(m => m.ts >= from).map(m =>
+                    `<div class="tl-mark" style="left:${pct(m.ts)}%" data-tip="${esc(m.tip)}"></div>`).join('');
+                return `
+                    <div class="flex items-center gap-3 mb-2">
+                        <div class="w-24 sm:w-36 flex-shrink-0 text-xs text-gray-400 truncate" title="${esc(r.label)}">${esc(r.label)}</div>
+                        <div class="flex-1 tl-track">${segHtml}${markHtml}</div>
+                    </div>`;
+            }).join('');
+
+            // Time axis: pick a tick step that leaves ~70px per label
+            const el = document.getElementById('hist-timeline');
+            const trackWidth = Math.max(120, el.clientWidth - 150);
+            const steps = [1, 2, 3, 6, 12, 24].map(h => h * 3_600_000);
+            const step = steps.find(st => span / st <= trackWidth / 70) || 24 * 3_600_000;
+            const ticks = [];
+            const d = new Date(from); d.setMinutes(0, 0, 0);
+            for (let t = d.getTime(); t <= now; t += 3_600_000) {
+                const local = new Date(t);
+                const hoursSinceMidnight = local.getHours();
+                // Skip ticks that would collide with the "now" label at the right edge
+                if (t > from && pct(t) < 100 - 3600 / trackWidth && (hoursSinceMidnight * 3_600_000) % step === 0) ticks.push(t);
+            }
+            const tickHtml = ticks.map(t => {
+                const lbl = new Date(t).getHours() === 0 || step >= 24 * 3_600_000
+                    ? new Date(t).toLocaleDateString([], { weekday: 'short', day: 'numeric' })
+                    : new Date(t).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                return `<div class="absolute top-0 -translate-x-1/2 text-[10px] text-gray-600 font-mono whitespace-nowrap" style="left:${pct(t)}%">${lbl}</div>`;
+            }).join('');
+
+            el.innerHTML = rowHtml + `
+                <div class="flex items-center gap-3">
+                    <div class="w-24 sm:w-36 flex-shrink-0"></div>
+                    <div class="flex-1 relative h-4">${tickHtml}<div class="absolute top-0 right-0 text-[10px] text-gray-500 font-mono">now</div></div>
+                </div>`;
+
+            const legendKeys = ['power-off', 'gw-down', 'online', 'verifying', 'waking', 'alerted', 'waiting-for-power', 'shutdown', 'assumed-up', 'nodata'];
+            document.getElementById('hist-legend').innerHTML = legendKeys.map(k => {
+                const st = STATES[k];
+                const sw = st.nodata ? 'tl-nodata' : st.inferred ? 'tl-inferred' : '';
+                return `<span class="flex items-center gap-1.5"><span class="inline-block w-3 h-3 rounded-sm ${sw}" style="${st.nodata ? '' : 'background-color:' + st.color}"></span>${st.label}</span>`;
+            }).join('') + `<span class="flex items-center gap-1.5"><span class="inline-block w-0.5 h-3 bg-yellow-300"></span>Wake-on-LAN sent</span>`;
+        }
+
+        // One card per outage: power cuts (Pi was off) and router outages (Pi on, gateway down).
+        function renderOutages(now) {
+            const from = now - histHours * 3_600_000;
+            const assessments = histEvents.filter(e => e.type === 'outage-assessment');
+            const cards = [];
+
+            for (const ev of histEvents.filter(e => e.type === 'monitor-start' && e.cause === 'power-outage')) {
+                const a = assessments.find(x => x.kind === 'power' && x.start === ev.lastSeen);
+                cards.push({ kind: 'power', start: ev.lastSeen, powerBackAt: ev.bootAt, a });
+            }
+            for (const a of assessments.filter(x => x.kind === 'router')) cards.push({ kind: 'router', start: a.start, a });
+
+            const visible = cards.filter(c => (c.a ? c.a.gatewayBackAt : c.powerBackAt ?? c.start) >= from).sort((x, y) => y.start - x.start);
+            const el = document.getElementById('hist-outages');
+            if (!visible.length) {
+                el.innerHTML = `<p class="text-xs text-gray-600 md:col-span-2">No power or gateway outages in this period.</p>`;
+                return;
+            }
+
+            el.innerHTML = visible.map(c => {
+                const title = c.kind === 'power'
+                    ? `<span class="text-purple-300">🔌 Power outage</span>`
+                    : `<span class="text-red-300">🌐 Gateway outage</span> <span class="text-gray-500 font-normal">(Pi had power)</span>`;
+                const facts = [];
+                if (c.kind === 'power') facts.push(`Power off ≈ ${fmtDur(c.powerBackAt - c.start)} <span class="text-gray-600">(±30s)</span>`);
+                if (c.a) facts.push(`Gateway unreachable ${fmtDur(c.a.gatewayDownMs)}`);
+
+                let body;
+                if (!c.a) {
+                    body = `<p class="text-xs text-gray-500 mt-3">${now - c.powerBackAt < 15 * 60_000
+                        ? 'Assessing servers… (runs 2 min after the gateway is back)'
+                        : 'No server assessment recorded.'}</p>`;
+                } else if (!c.a.servers.length) {
+                    body = `<p class="text-xs text-gray-500 mt-3">No servers were being monitored.</p>`;
+                } else {
+                    body = `<ul class="mt-3 space-y-2">` + c.a.servers.map(r => {
+                        const v = VERDICTS[r.verdict] || { text: r.verdict, cls: 'bg-gray-800 text-gray-300 border-gray-600' };
+                        // Only follow-ups within 30 min of recovery belong to this outage
+                        const inRecovery = (e) => e.id === r.id && e.ts >= c.a.gatewayBackAt && e.ts <= c.a.gatewayBackAt + 30 * 60_000;
+                        const wol  = histEvents.find(e => e.type === 'wol-sent' && inRecovery(e));
+                        const back = histEvents.find(e => e.type === 'server-status' && e.to === 'online' && inRecovery(e));
+                        const follow = [];
+                        if (r.verdict === 'shutdown') follow.push(`off ≈ ${fmtShort(c.a.start + c.a.shutdownAfterMs)}`);
+                        if (r.verdict === 'uncertain') follow.push(r.reachable ? 'reachable after' : 'unreachable after');
+                        if (wol)  follow.push(`WoL ${fmtShort(wol.ts)}`);
+                        if (back && !r.reachable) follow.push(`back online ${fmtShort(back.ts)}`);
+                        return `<li class="flex flex-wrap items-center justify-between gap-2">
+                                    <span class="text-sm text-gray-200">${esc(r.name)}</span>
+                                    <span class="flex flex-col items-end gap-0.5">
+                                        <span class="px-2 py-0.5 text-[11px] font-semibold rounded-md border ${v.cls}">${v.text}</span>
+                                        ${follow.length ? `<span class="text-[11px] text-gray-500 font-mono">${follow.join(' · ')}</span>` : ''}
+                                    </span>
+                                </li>`;
+                    }).join('') + `</ul>`;
+                }
+
+                const end = c.a ? c.a.gatewayBackAt : c.powerBackAt;
+                return `<div class="bg-gray-800/40 border border-gray-800 rounded-lg p-4">
+                            <p class="text-sm font-semibold">${title}</p>
+                            <p class="text-xs text-gray-400 font-mono mt-1">${fmtShort(c.start)} → ${fmtShort(end)}</p>
+                            <p class="text-xs text-gray-500 mt-1">${facts.join(' · ')}</p>
+                            ${body}
+                        </div>`;
+            }).join('');
+        }
+
+        function describeEvent(ev) {
+            switch (ev.type) {
+                case 'monitor-start':
+                    if (ev.cause === 'power-outage') return ['🔌', `Power outage – Pi was off ${fmtTime(ev.lastSeen)} → ${fmtTime(ev.bootAt)} (≈ ${fmtDur(ev.bootAt - ev.lastSeen)}). Monitor restarted.`, 'text-purple-300'];
+                    if (ev.cause === 'pi-reboot')    return ['🔁', `Pi rebooted (clean shutdown, down ${fmtDur(ev.ts - ev.lastSeen)}). Monitor restarted.`, 'text-gray-300'];
+                    if (ev.cause === 'app-restart')  return ['♻️', `Monitor app restarted (not running for ${fmtDur(ev.ts - ev.lastSeen)}).`, 'text-gray-400'];
+                    return ['▶️', 'Monitor started – history begins.', 'text-gray-400'];
+                case 'gateway':
+                    return ev.alive ? ['🌐', 'Gateway reachable.', 'text-emerald-300'] : ['🌐', 'Gateway unreachable.', 'text-red-300'];
+                case 'server-status': {
+                    const st = STATES[ev.to] || { label: ev.to };
+                    const cls = ev.to === 'online' ? 'text-emerald-300' : ev.to === 'verifying' ? 'text-orange-300' : 'text-red-300';
+                    return ['🖥️', `${esc(ev.name)}: ${st.label}`, cls];
+                }
+                case 'wol-sent':        return ['⚡', `Wake-on-LAN sent to ${esc(ev.name)}.`, 'text-yellow-300'];
+                case 'email-sent':      return ['✉️', `Email sent: ${esc(ev.subject)}`, 'text-blue-300'];
+                case 'server-added':    return ['➕', `Server added: ${esc(ev.name)} (${esc(ev.ip)})`, 'text-gray-400'];
+                case 'server-removed':  return ['➖', `Server removed: ${esc(ev.name)}`, 'text-gray-400'];
+                case 'outage-assessment': {
+                    const parts = ev.servers.map(r => `${esc(r.name)} – ${(VERDICTS[r.verdict] || { text: r.verdict }).text.toLowerCase()}`);
+                    return ['🧾', `${ev.kind === 'power' ? 'Power' : 'Gateway'} outage assessed (gateway down ${fmtDur(ev.gatewayDownMs)}): ${parts.join('; ') || 'no servers'}`, 'text-indigo-300'];
+                }
+                default: return ['•', esc(ev.type), 'text-gray-400'];
+            }
+        }
+
+        function renderLog(now) {
+            const from = now - histHours * 3_600_000;
+            const list = histEvents.filter(e => e.ts >= from).slice(-500).reverse();
+            document.getElementById('hist-log').innerHTML = list.length
+                ? list.map(ev => {
+                    const [icon, text, cls] = describeEvent(ev);
+                    return `<div class="flex gap-3 px-3 py-2 text-xs">
+                                <span class="font-mono text-gray-600 whitespace-nowrap">${fmtTime(ev.ts)}</span>
+                                <span>${icon}</span>
+                                <span class="${cls}">${text}</span>
+                            </div>`;
+                }).join('')
+                : `<p class="px-3 py-4 text-xs text-gray-600">No events in this period.</p>`;
+        }
+
+        function renderHistory() {
+            const now = Date.now();
+            document.querySelectorAll('#hist-range button').forEach(b => b.classList.toggle('active', parseInt(b.dataset.hours) === histHours));
+            renderTimeline(now);
+            renderOutages(now);
+            renderLog(now);
+        }
+
+        async function loadHistory() {
+            try {
+                const data = await fetch('/api/history').then(r => r.json());
+                histEvents  = data.events.sort((a, b) => a.ts - b.ts);
+                histServers = data.servers;
+                histShutdownAfterMs = data.shutdownAfterMs;
+                document.getElementById('hist-sub').textContent = data.clockSynced
+                    ? `Power, gateway and server state over time · servers shut down after ${fmtDur(histShutdownAfterMs)} without the gateway`
+                    : 'Waiting for the Pi’s clock to sync (NTP) – events will appear once it does';
+                renderHistory();
+            } catch (err) {
+                document.getElementById('hist-sub').textContent = 'Could not load history: ' + err.message;
+            }
+        }
+
+        socket.on('history-event', (ev) => {
+            histEvents.push(ev);
+            histEvents.sort((a, b) => a.ts - b.ts);
+            // The first event after a clock sync means the sub-heading is stale – reload everything
+            if (ev.type === 'monitor-start') return loadHistory();
+            renderHistory();
+        });
+        socket.on('status-update', (servers) => {
+            const names = servers.map(s => s.id + s.name).join();
+            if (names !== histServers.map(s => s.id + s.name).join()) {
+                histServers = servers.map(({ id, name }) => ({ id, name }));
+                renderHistory();
+            }
+        });
+        socket.on('connect', loadHistory); // also reloads after the Pi comes back from an outage
+
+        document.getElementById('hist-range').addEventListener('click', (e) => {
+            const hours = parseInt(e.target.dataset?.hours);
+            if (!hours) return;
+            histHours = hours;
+            try { localStorage.setItem('histHours', hours); } catch {}
+            renderHistory();
+        });
+
+        // Tooltip for timeline segments / markers (hover on desktop, tap on mobile)
+        const tip = document.getElementById('hist-tip');
+        function showTip(e) {
+            const t = e.target.closest('[data-tip]');
+            if (!t) { tip.classList.add('hidden'); return; }
+            tip.textContent = t.dataset.tip;
+            tip.classList.remove('hidden');
+            const x = Math.min(e.clientX + 12, window.innerWidth - tip.offsetWidth - 8);
+            const y = e.clientY + 16 + tip.offsetHeight > window.innerHeight ? e.clientY - tip.offsetHeight - 10 : e.clientY + 16;
+            tip.style.left = Math.max(8, x) + 'px';
+            tip.style.top  = y + 'px';
+        }
+        const timelineEl = document.getElementById('hist-timeline');
+        timelineEl.addEventListener('mousemove', showTip);
+        timelineEl.addEventListener('click', showTip);
+        timelineEl.addEventListener('mouseleave', () => tip.classList.add('hidden'));
+
+        let resizeTimer;
+        window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(renderHistory, 150); });
+        setInterval(renderHistory, 30_000); // keep "now" moving
     </script>
 </body>
 

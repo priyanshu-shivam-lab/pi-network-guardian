@@ -1,3 +1,7 @@
 node_modules/
 .env
 servers.json
+history.jsonl
+history.jsonl.tmp
+heartbeat.json
+heartbeat.json.tmp
