@@ -17,6 +17,7 @@ A lightweight Node.js server monitor designed to run on a **Raspberry Pi** (or a
 | **Deferred email alerts** | Email cannot be sent during an outage (no gateway). The alert is queued and dispatched the moment the gateway comes back online |
 | **Persistent server list** | Servers are saved to `servers.json` and survive restarts |
 | **In-browser SMTP config** | Configure email settings and send a test email without touching config files |
+| **History (7 days)** | Timeline of power, gateway and each server, a card per outage saying whether each server shut down because of it, and a full event log |
 
 ---
 
@@ -75,6 +76,9 @@ SMTP_PASS=your-app-password   # Use a Gmail App Password, not your account passw
 
 # Where to send outage alert emails
 ADMIN_EMAIL=admin@yourdomain.com
+
+# Minutes your servers' own shutdown script waits with the gateway unreachable
+SERVER_SHUTDOWN_AFTER_MIN=5
 ```
 
 > **Gmail users:** Generate an App Password at [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords). Do **not** use your Gmail account password.
@@ -99,6 +103,29 @@ Click the **⚙️ Email Alerts** button in the top-right corner. Enter your SMT
 
 ### Removing a server
 Click the **Remove** button on any server card. The change is saved immediately.
+
+---
+
+## History
+
+The **History** section of the dashboard shows the last 6h / 24h / 7d as a timeline (power, gateway and one row per server), a card per outage, and an event log. Data is kept in `history.jsonl` for 7 days.
+
+The Pi has no battery, so during a power cut it is off and sees nothing. History fills that gap after the fact:
+
+- **Power outages** – the app writes a heartbeat every 30s. After boot, if the Pi's boot time is later than the last heartbeat (and the app wasn't stopped cleanly), the gap is recorded as a power outage (start accurate to ±30s).
+- **Reboot vs. deploy** – a clean stop (pm2 reload, `sudo reboot`) is not counted as an outage; an app-only restart is shown as "no data".
+- **Did the servers shut down?** – 2 minutes after the gateway is back, each server is classified by comparing how long the gateway was unreachable with `SERVER_SHUTDOWN_AFTER_MIN` and whether it answers pings:
+
+| Gateway down | Server reachable after | Verdict |
+|---|---|---|
+| ≥ shutdown time | no | Shut down – power failure |
+| < shutdown time | yes | Stayed up on UPS |
+| ≥ shutdown time | yes | Stayed up – expected shutdown (check the server's script) |
+| < shutdown time | no | Down – not explained by outage |
+| within 30s of the shutdown time | – | Uncertain |
+
+  Gateway outages while the Pi has power (router reboot or fault) are assessed the same way.
+- **Clock** – a Pi has no RTC, so after boot its clock is wrong until NTP syncs through the router. Events are held in memory and only written once `timedatectl` reports the clock synced (or after 10 minutes).
 
 ---
 
@@ -133,7 +160,10 @@ pi-network-guardian/
 ├── public/
 │   └── index.html     # Frontend: real-time dashboard
 ├── deploy.sh          # Run on Pi to pull & reload: bash deploy.sh
+├── events.js          # History: event log, heartbeat, power-outage detection
 ├── servers.json       # Auto-generated: persisted server list (git-ignored)
+├── history.jsonl      # Auto-generated: 7 days of events (git-ignored)
+├── heartbeat.json     # Auto-generated: last time the app was alive (git-ignored)
 ├── .env               # Your credentials (git-ignored)
 ├── .env.example       # Template — safe to commit
 ├── DEPLOY.md          # Full deployment guide
