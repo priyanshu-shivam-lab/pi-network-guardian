@@ -71,7 +71,7 @@ nano .env
 Fill in all the values:
 
 ```dotenv
-GATEWAY_IP=192.168.1.1        # your router IP
+GATEWAY_IP=192.168.1.1        # your router IP (initial value; editable later in the dashboard)
 PORT=3000
 SMTP_HOST=smtp.gmail.com
 SMTP_PORT=587
