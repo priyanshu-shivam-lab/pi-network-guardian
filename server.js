@@ -7,6 +7,7 @@ const wol = require('wake_on_lan');
 const nodemailer = require('nodemailer');
 const fs = require('fs');
 const path = require('path');
+const net = require('net');
 const history = require('./events');
 
 const app = express();
@@ -16,8 +17,33 @@ const io = new Server(server);
 app.use(express.json());
 app.use(express.static('public'));
 
-// --- Configuration & State ---
-const GATEWAY_IP = process.env.GATEWAY_IP || '192.168.1.1';
+// --- Persistent settings (saved to disk, editable via the UI) ---
+// GATEWAY_IP in .env only seeds the value on first run; after that settings.json wins.
+const SETTINGS_FILE = path.join(__dirname, 'settings.json');
+
+function loadSettings() {
+    const defaults = { gatewayIp: process.env.GATEWAY_IP || '192.168.1.1' };
+    try {
+        if (fs.existsSync(SETTINGS_FILE)) {
+            const parsed = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
+            if (parsed && net.isIP(parsed.gatewayIp)) return { ...defaults, ...parsed };
+            console.warn('[STORE] settings.json has no valid gatewayIp, using default.');
+        }
+    } catch (err) {
+        console.warn('[STORE] Could not load settings.json, using defaults:', err.message);
+    }
+    return defaults;
+}
+
+function saveSettings() {
+    try {
+        fs.writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2), 'utf8');
+    } catch (err) {
+        console.error('[STORE] Failed to save settings.json:', err.message);
+    }
+}
+
+const settings = loadSettings();
 
 // --- Persistent server list (saved to disk) ---
 const SERVERS_FILE = path.join(__dirname, 'servers.json');
@@ -333,6 +359,36 @@ app.post('/api/config/email', (req, res) => {
     res.json({ success: true });
 });
 
+// --- Gateway Config API ---
+app.get('/api/config/gateway', (req, res) => res.json({ gatewayIp: settings.gatewayIp }));
+
+// Body: { gatewayIp, force? }. A wrong IP would immediately look like a power outage,
+// so the new address must answer a ping unless the caller explicitly forces it.
+app.post('/api/config/gateway', async (req, res) => {
+    const gatewayIp = String(req.body.gatewayIp || '').trim();
+    if (!net.isIP(gatewayIp)) return res.status(400).json({ error: 'Enter a valid IPv4 or IPv6 address.' });
+    if (gatewayIp === settings.gatewayIp) return res.json({ success: true, gatewayIp });
+
+    if (!req.body.force) {
+        const probe = await ping.promise.probe(gatewayIp, { timeout: 2 });
+        if (!probe.alive) {
+            return res.status(409).json({ error: `${gatewayIp} did not respond to ping.`, unreachable: true });
+        }
+    }
+
+    const from = settings.gatewayIp;
+    settings.gatewayIp = gatewayIp;
+    saveSettings();
+    console.log(`[CONFIG] Gateway IP changed: ${from} → ${gatewayIp}`);
+    history.record('gateway-ip-changed', { from, to: gatewayIp });
+    io.emit('gateway-status', {
+        alive:           !gatewayWasDown,
+        outageStartTime: gatewayWasDown ? outageStartTime : null,
+        gatewayIp,
+    });
+    res.json({ success: true, gatewayIp });
+});
+
 // Send a test email to verify SMTP settings
 app.post('/api/config/email/test', async (req, res) => {
     const transporter = buildTransporter();
@@ -370,7 +426,7 @@ let gatewayDownSinceMono = null; // performance.now() when the gateway last went
 let gatewayDownAtStart  = false; // first check after startup failed → tail of a power outage, not a router outage
 
 async function checkGateway() {
-    const res = await ping.promise.probe(GATEWAY_IP, { timeout: 2 });
+    const res = await ping.promise.probe(settings.gatewayIp, { timeout: 2 });
     if (res.alive !== lastGatewayAlive) {
         history.record('gateway', { alive: res.alive });
         if (lastGatewayAlive === null && !res.alive) gatewayDownAtStart = true;
@@ -669,7 +725,7 @@ io.on('connection', (socket) => {
     socket.emit('gateway-status', {
         alive:           !gatewayWasDown,
         outageStartTime: gatewayWasDown ? outageStartTime : null,
-        gatewayIp:       GATEWAY_IP,
+        gatewayIp:       settings.gatewayIp,
     });
 });
 

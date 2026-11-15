@@ -62,7 +62,7 @@ cp .env.example .env
 Edit `.env`:
 
 ```dotenv
-# Your router / default gateway IP
+# Your router / default gateway IP (initial value only – change it later from the dashboard)
 GATEWAY_IP=192.168.1.1
 
 # Port for the web dashboard
@@ -101,6 +101,9 @@ Open `http://localhost:3000` in your browser.
 
 ### Adding a server
 Fill in **Name**, **IP address**, and **MAC address** in the form at the bottom of the dashboard and click **Add Server**.
+
+### Changing the gateway IP
+Click **✎ Edit** next to the IP on the **Default Gateway** card, enter the new address and click **Save**. The new IP is pinged first; if it doesn't answer you're asked to confirm, since a wrong gateway makes every server look like it lost power. The value is saved to `settings.json` and takes precedence over `GATEWAY_IP` in `.env`.
 
 ### Configuring email alerts
 Click the **⚙️ Email Alerts** button in the top-right corner. Enter your SMTP settings and click **Save Settings**. Use **Send Test Email** to verify before relying on it during a real outage.

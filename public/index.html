@@ -87,7 +87,20 @@
                      bg-emerald-500/10 border border-emerald-500/30">🌐</div>
                 <div class="min-w-0">
                     <p class="text-sm font-semibold text-white leading-none">Default Gateway</p>
-                    <p id="gw-ip" class="text-xs font-mono text-gray-500 mt-0.5">—</p>
+                    <div id="gw-ip-view" class="flex items-center gap-2 mt-0.5">
+                        <p id="gw-ip" class="text-xs font-mono text-gray-500">—</p>
+                        <button type="button" onclick="startGatewayEdit()" title="Change gateway IP"
+                            class="text-xs text-gray-500 hover:text-gray-300 border border-gray-700 hover:border-gray-500 px-1.5 py-0.5 rounded transition">✎ Edit</button>
+                    </div>
+                    <form id="gw-ip-form" class="hidden mt-1 flex items-center gap-1.5">
+                        <input type="text" id="gw-ip-input" placeholder="192.168.1.1" autocomplete="off" spellcheck="false"
+                            class="w-36 bg-gray-800 border border-gray-700 rounded px-2 py-1 text-xs text-white font-mono placeholder-gray-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500/30">
+                        <button type="submit" id="gw-ip-save"
+                            class="text-xs bg-blue-600 hover:bg-blue-500 text-white font-semibold px-2 py-1 rounded transition">Save</button>
+                        <button type="button" onclick="cancelGatewayEdit()"
+                            class="text-xs bg-gray-700 hover:bg-gray-600 text-gray-200 px-2 py-1 rounded transition">Cancel</button>
+                    </form>
+                    <p id="gw-ip-msg" class="hidden text-xs text-red-400 mt-1"></p>
                 </div>
             </div>
 
@@ -351,6 +364,69 @@
                     updateOutageTimer();
                 }
             }
+        });
+
+        // ── Gateway IP editing ────────────────────────────────────────────────
+        const gwIpForm  = document.getElementById('gw-ip-form');
+        const gwIpInput = document.getElementById('gw-ip-input');
+        const gwIpMsg   = document.getElementById('gw-ip-msg');
+
+        function setGatewayMsg(msg) {
+            gwIpMsg.textContent = msg;
+            gwIpMsg.classList.toggle('hidden', !msg);
+        }
+
+        function startGatewayEdit() {
+            const current = document.getElementById('gw-ip').textContent;
+            gwIpInput.value = current === '—' ? '' : current;
+            document.getElementById('gw-ip-view').classList.add('hidden');
+            gwIpForm.classList.remove('hidden');
+            setGatewayMsg('');
+            gwIpInput.focus();
+            gwIpInput.select();
+        }
+
+        function cancelGatewayEdit() {
+            gwIpForm.classList.add('hidden');
+            document.getElementById('gw-ip-view').classList.remove('hidden');
+            setGatewayMsg('');
+        }
+
+        gwIpInput.addEventListener('keydown', (e) => { if (e.key === 'Escape') cancelGatewayEdit(); });
+
+        async function saveGatewayIp(gatewayIp, force) {
+            const res = await fetch('/api/config/gateway', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ gatewayIp, force }),
+            });
+            return { res, data: await res.json().catch(() => ({})) };
+        }
+
+        gwIpForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const gatewayIp = gwIpInput.value.trim();
+            const saveBtn = document.getElementById('gw-ip-save');
+            saveBtn.disabled = true;
+            saveBtn.textContent = 'Checking…';
+            setGatewayMsg('');
+            try {
+                let { res, data } = await saveGatewayIp(gatewayIp, false);
+                if (res.status === 409 && data.unreachable &&
+                    confirm(`${data.error}\n\nIf this is wrong, every server will be marked as POWER LOSS. Save anyway?`)) {
+                    ({ res, data } = await saveGatewayIp(gatewayIp, true));
+                }
+                if (res.ok) {
+                    document.getElementById('gw-ip').textContent = data.gatewayIp;
+                    cancelGatewayEdit();
+                } else if (res.status !== 409) {
+                    setGatewayMsg(data.error || 'Failed to save gateway IP.');
+                }
+            } catch (err) {
+                setGatewayMsg('Network error: ' + err.message);
+            }
+            saveBtn.disabled = false;
+            saveBtn.textContent = 'Save';
         });
 
         function updateOutageTimer() {
@@ -754,6 +830,7 @@
                 case 'email-sent':      return ['✉️', `Email sent: ${esc(ev.subject)}`, 'text-blue-300'];
                 case 'server-added':    return ['➕', `Server added: ${esc(ev.name)} (${esc(ev.ip)})`, 'text-gray-400'];
                 case 'server-removed':  return ['➖', `Server removed: ${esc(ev.name)}`, 'text-gray-400'];
+                case 'gateway-ip-changed': return ['🌐', `Gateway IP changed: ${esc(ev.from)} → ${esc(ev.to)}`, 'text-gray-400'];
                 case 'outage-assessment': {
                     const parts = ev.servers.map(r => `${esc(r.name)} – ${(VERDICTS[r.verdict] || { text: r.verdict }).text.toLowerCase()}`);
                     return ['🧾', `${ev.kind === 'power' ? 'Power' : 'Gateway'} outage assessed (gateway down ${fmtDur(ev.gatewayDownMs)}): ${parts.join('; ') || 'no servers'}`, 'text-indigo-300'];
